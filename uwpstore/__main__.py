@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -179,7 +180,12 @@ def main() -> int:
     from .paths import APP_ID
     from .ui.window import StoreWindow
 
-    app = Adw.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+    flags = Gio.ApplicationFlags.DEFAULT_FLAGS
+    # a copy on a test or remote display (Broadway) must not become the single instance that a desktop launch
+    # then hands its window to, out of sight
+    if os.environ.get("GDK_BACKEND") == "broadway" or os.environ.get("UWP_STORE_SEPARATE"):
+        flags |= Gio.ApplicationFlags.NON_UNIQUE
+    app = Adw.Application(application_id=APP_ID, flags=flags)
     from gi.repository import Gtk
     Gtk.Window.set_default_icon_name(APP_ID)   # installed by install-desktop.sh
 
