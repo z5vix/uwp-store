@@ -8,7 +8,7 @@ from typing import Callable
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from .. import account, catalog, fe3, installer, packages, runtimes
+from .. import account, catalog, desktop, fe3, installer, packages, runtimes
 from . import widgets
 from .util import clear, human_size, load_image, run_async, stars
 
@@ -175,9 +175,14 @@ class SearchPage(Gtk.Box):
 # ---- product -----------------------------------------------------------------------------------
 
 class ProductPage(Gtk.Box):
-    def __init__(self, product_id: str, toast: Callable[[str], None], open_settings: Callable[[], None]) -> None:
+    def __init__(self, product_id: str, toast: Callable[[str], None], open_settings: Callable[[], None],
+                 open_product: OpenProduct | None = None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.product_id = product_id
+        self.open_product = open_product
+        self.owned: bool | None = None          # None: not known (signed out, or still asking)
+        self.offer_error = ""                   # why the delivery service has no installable package
+        self.checking = False
         self.toast = toast
         self.open_settings = open_settings
         self.product: catalog.Product | None = None
@@ -291,10 +296,46 @@ class ProductPage(Gtk.Box):
             body.append(packages_group)
 
         self.append(widgets.page_scroller(body))
+        if product.bundled_ids:
+            body.insert_child_after(self._bundle_group(product), header)
+
         self.job = installer.get().active_for(product.product_id)
         self._refresh()
-        if product.category_id and product.is_free and not product.is_msixvc:
+        if not product.is_free and account.signed_in():
+            self._check_owned()
+        elif product.category_id:
             self._check_offer()
+
+    def _bundle_group(self, product: catalog.Product) -> Gtk.Widget:
+        group = Adw.PreferencesGroup(title="Included in this bundle",
+                                     description="Each part installs from its own page")
+        for pid in product.bundled_ids:
+            row = Adw.ActionRow(title=pid, activatable=True)
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            row.connect("activated", lambda _r, p=pid: self.open_product and self.open_product(p, ""))
+            group.add(row)
+            run_async(lambda p=pid: catalog.product(p), lambda info, r=row: (r.set_title(info.title),
+                      r.set_subtitle(info.publisher)), lambda _e: None)
+        return group
+
+    def _check_owned(self) -> None:
+        """Ask the licence service whether the signed-in account owns this product."""
+        self.checking = True
+        self._refresh()
+
+        def done(owned: bool) -> None:
+            self.owned = owned
+            self.checking = False
+            if owned and self.product.category_id:
+                self._check_offer()
+            else:
+                self._refresh()
+
+        def failed(error: Exception) -> None:
+            self.checking = False
+            self.toast(f"Couldn't check your licence: {error}")
+            self._refresh()
+        run_async(lambda: account.owns(self.product.product_id), done, failed)
 
     def _check_offer(self) -> None:
         """Ask the delivery service for the newest package, to offer an update over an older install."""
@@ -306,8 +347,15 @@ class ProductPage(Gtk.Box):
 
         def done(result) -> None:
             self.resolution, self.offer = result
+            self.checking = False
             self._refresh()
-        run_async(work, done, lambda e: None)
+
+        def failed(error: Exception) -> None:
+            self.offer_error = str(error)
+            self.checking = False
+            self._refresh()
+        self.checking = True
+        run_async(work, done, failed)
 
     @staticmethod
     def _row(group: Adw.PreferencesGroup, title: str, value: str) -> None:
@@ -318,7 +366,7 @@ class ProductPage(Gtk.Box):
     @staticmethod
     def _package_kind(product: catalog.Product) -> str:
         if product.is_msixvc:
-            return "MSIXVC (Xbox PC game; not installable here yet)"
+            return "MSIXVC (Xbox PC game; installs through the Xbox app)"
         if product.installer.lower() in ("windowsupdate", ""):
             return "MSIX/AppX through Store delivery"
         return f"Publisher installer ({product.installer}), run with Wine"
@@ -388,10 +436,22 @@ class ProductPage(Gtk.Box):
                 return runtime, app
         return None
 
+    def _xbox_app(self) -> tuple[runtimes.Runtime, runtimes.InstalledApp] | None:
+        for runtime in runtimes.discover():
+            app = runtime.find_app(runtimes.XBOX_APP_FAMILY)
+            if app:
+                return runtime, app
+        return None
+
+    def _via_xbox(self) -> bool:
+        """Xbox PC (GDK/MSIXVC) games install through the Xbox app; the Store's own delivery has nothing for them."""
+        return self.product.is_msixvc and (self.offer is None) and (bool(self.offer_error) or not self.product.category_id)
+
     def _refresh(self) -> None:
         if not self.product:
             return
         job = self.job
+        self.button.set_sensitive(True)
         if job and not job.finished:
             self.button.set_label("Cancel")
             self.button.remove_css_class("suggested-action")
@@ -408,6 +468,8 @@ class ProductPage(Gtk.Box):
         self.button.add_css_class("suggested-action")
         installed = self._installed()
         outdated = self.offer.outdated() if self.offer else []
+        failed = f"Last attempt failed: {job.error}" if job and job.state == "failed" else ""
+        entitled = self.product.is_free or self.owned
         if outdated:
             runtime, app = outdated[0]
             self.button.set_label("Update")
@@ -416,16 +478,32 @@ class ProductPage(Gtk.Box):
             self.button.set_label("Open")
             version = f" ({installed[1].version})" if installed[1].version else ""
             self.status.set_label(f"Installed in {installed[0].name}{version}")
-        elif self.product.is_msixvc:
-            self.button.set_label("Not supported yet")
+        elif self.checking:
+            self.button.set_label("Checking…")
             self.button.set_sensitive(False)
-            self.status.set_label("Xbox PC (MSIXVC) games need the Xbox app's install path")
-        elif not self.product.is_free:
-            self.button.set_label(self.product.price)
-            self.status.set_label("Paid: buy on Microsoft's site; owned titles need account sign-in")
+            self.status.set_label("Checking your licence" if self.owned is None and not self.product.is_free
+                                  else "Asking the Store for packages")
+        elif entitled and self.product.bundled_ids and not self.product.category_id:
+            self.button.set_label("Owned" if self.owned else "Included")
+            self.button.set_sensitive(False)
+            self.status.set_label("Install each part below")
+        elif entitled and self._via_xbox():
+            if self._xbox_app():
+                self.button.set_label("Install in Xbox app")
+                self.status.set_label(("You own this. " if self.owned else "") +
+                                      "Xbox PC games install through the Xbox app (sign in there once)")
+            else:
+                self.button.set_label("Get the Xbox app")
+                self.status.set_label("Xbox PC games install through the Xbox app, which isn't installed yet")
+        elif entitled:
+            self.button.set_label("Get" if self.product.is_free else "Install")
+            self.status.set_label(failed or ("You own this" if self.owned else ""))
+        elif self.owned is False:
+            self.button.set_label(self.product.price or "Buy")
+            self.status.set_label("Not owned by your account: buy on Microsoft's site")
         else:
-            self.button.set_label("Get")
-            self.status.set_label("" if not job or job.state != "failed" else f"Last attempt failed: {job.error}")
+            self.button.set_label(self.product.price or "Buy")
+            self.status.set_label("Sign in (person icon) to install games you own, or buy on Microsoft's site")
 
     def _on_action(self, _button: Gtk.Button) -> None:
         if not self.product:
@@ -433,11 +511,11 @@ class ProductPage(Gtk.Box):
         if self.job and not self.job.finished:
             installer.get().cancel(self.job)
             return
+        logo = catalog.image_url(catalog.pick_image(self.product.images, ("logo", "tile", "BoxArt")), 192) or ""
         outdated = self.offer.outdated() if self.offer else []
         if outdated:
             runtime, _app = outdated[0]
-            logo = catalog.image_url(catalog.pick_image(self.product.images, ("logo", "tile", "BoxArt")), 192)
-            self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo or "",
+            self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo,
                                                self.product.is_game, runtime.id)
             self._refresh()
             return
@@ -447,17 +525,27 @@ class ProductPage(Gtk.Box):
             runtime.run(app)
             self.toast(f"Starting {app.title}")
             return
-        if not self.product.is_free:
+        entitled = self.product.is_free or self.owned
+        if not entitled:
             Gtk.UriLauncher(uri=f"https://apps.microsoft.com/detail/{self.product.product_id}").launch(
                 self.get_root(), None, None, None)
+            return
+        if self._via_xbox():
+            xbox = self._xbox_app()
+            if xbox is None:
+                if self.open_product:
+                    self.open_product(installer.XBOX_APP_PRODUCT_ID, "Xbox")
+                return
+            runtime, _app = xbox
+            runtime.activate(f"msxbox://game/?productId={self.product.product_id}")
+            self.toast(f"Opening {self.product.title} in the Xbox app")
             return
         runtime = runtimes.runtime_for(self.product.is_game)
         if runtime is None or not runtime.ready():
             self.toast("Finish setting up a runtime first")
             self.open_settings()
             return
-        logo = catalog.image_url(catalog.pick_image(self.product.images, ("logo", "tile", "BoxArt")), 192)
-        self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo or "", self.product.is_game)
+        self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo, self.product.is_game)
         self._refresh()
 
     def _job_changed(self, job: installer.Job) -> None:
@@ -539,6 +627,9 @@ class LibraryPage(Gtk.Box):
         if not runtime.running(app):
             play.add_css_class("suggested-action")
         play.connect("clicked", lambda b: self._toggle(runtime, app, b))
+        if not app.launchable:
+            play.set_sensitive(False)
+            play.set_tooltip_text("This package has nothing to start (content or an add-on)")
         row.add_suffix(play)
 
         menu = Gio.Menu()
@@ -583,7 +674,7 @@ class LibraryPage(Gtk.Box):
 
         def response(_d, choice: str) -> None:
             if choice == "uninstall":
-                run_async(lambda: runtime.uninstall(app), lambda _r: (self.toast(f"{app.title} uninstalled"), self.reload()),
+                run_async(lambda: (runtime.uninstall(app), desktop.sync()), lambda _r: (self.toast(f"{app.title} uninstalled"), self.reload()),
                           lambda e: self.toast(str(e)))
         dialog.connect("response", response)
         dialog.present(self.get_root())

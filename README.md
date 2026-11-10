@@ -49,7 +49,32 @@ Command line, for scripting and debugging:
 ./uwp-store store                     # Microsoft Store app: newest offered vs installed per runtime
 ./uwp-store install 9WZDNCRFJBMP --runtime v1-runtime-wow64   # install/update it in one runtime
 ./uwp-store signin | account | signout
+./uwp-store menu                      # start-menu entries for installed apps (done automatically)
 ```
+
+## Start menu
+
+Every app you install gets its own start-menu entry, with the package's icon, and loses it again on uninstall
+(Settings → Store → *Add installed apps to the start menu* turns this off). Helper packages the manifest keeps off
+Windows' Start menu (`AppListEntry="none"`, such as StorePurchaseApp) stay off it here too. When the same app is in
+two runtimes, each entry names its runtime. Entries are `~/.local/share/applications/uwpstore-*.desktop`.
+
+## Games you own
+
+Signed in, a paid product's page asks Microsoft's licence service (`collections.mp.microsoft.com`, as Wine-UWP does)
+whether your account owns it:
+
+- **Owned, with a Store package** (Minecraft for Windows, for example, which the delivery service offers as a plain
+  `.appx`): the button is *Install* and it installs like a free app.
+- **Owned Xbox PC (GDK/MSIXVC) games** (Minecraft Launcher, most Xbox titles): they have no Store package, so the
+  button opens the game's page in the Xbox app (`msxbox://game/?productId=…`). The Xbox app installs it there with
+  Wine-UWP's Gaming Services stand-in. Sign in inside the Xbox app once: it keeps its own sign-in per prefix.
+- **Bundles** (Minecraft: Java & Bedrock) list their parts, each with its own page.
+- Game Pass access is not ownership; those titles install through the Xbox app.
+
+The Xbox app from 2612 starts `XboxPcAppCE.exe`, a launcher that hands off to the real app through `msxboxl:`, which
+Wine-UWP does not route. The store points such packages at their real entry point (`LAUNCH_FIXES` in
+`uwpstore/runtimes.py`).
 
 ## Microsoft account
 
@@ -85,6 +110,7 @@ already harvested one (`~/.local/share/ms-store-uwp/data*/windows`), v2 uses it.
 | --- | --- |
 | `uwpstore/catalog.py` | `storeedgefd.dsx.mp.microsoft.com/v9.0`: page layouts (home, gaming), collections, search, product details, publisher installers. No account. |
 | `uwpstore/account.py` | Microsoft account: device-code sign-in, refresh token in the keyring, per-scope tickets, Xbox Live gamertag. |
+| `uwpstore/desktop.py` | Start-menu entries for installed apps. |
 | `uwpstore/fe3.py` | The Store's package delivery (FE3, the Windows Update protocol): a product's WuCategoryId → every package and framework → signed CDN URLs. Anonymous for free products. |
 | `uwpstore/net.py` | HTTP with a disk cache (store opens offline from cache), resumable downloads, digest checks. The delivery hosts chain to *Microsoft Root Certificate Authority 2011*, which Linux CA bundles lack; that root (`microsoft-root-2011.pem`, SHA-256 `847DF6A7…ED7C61`) is trusted for `*.delivery.mp.microsoft.com` only. TLS verification is never disabled. |
 | `uwpstore/installer.py` | Install queue: pick the newest unencrypted x64/neutral package, download and verify it, fetch any framework the Windows files lack (extracted into the profile's `stage/frameworks`), then `wine-uwp install`. Products the Store lists with a publisher installer (Win32 `.exe`/`.msi`) are downloaded, SHA-256 checked and run with the runtime's Wine. |
@@ -111,9 +137,9 @@ plain wine-uwp runtime (both are selectable in Settings).
 
 ## Limits
 
-- Buying happens on Microsoft's site: paid products link to their web page. Signing in lets the delivery service offer
-  the packages your account is licensed for. Nothing bypasses licensing, and encrypted packages (`.eappx`, `.emsix`) are refused.
-- Xbox PC games shipped as MSIXVC (Minecraft Launcher, most Game Pass titles) need the licence and the Xbox app's install path; their pages say so.
+- Buying happens on Microsoft's site: paid products you do not own link to their web page.
+- Whether an owned game *runs* depends on Wine-UWP answering its licence check at run time; installing it is not proof. Nothing bypasses licensing, and encrypted packages (`.eappx`, `.emsix`) are refused.
+- Xbox PC games shipped as MSIXVC install only through the Xbox app (see *Games you own*).
 - Apps built on frameworks the Windows image and the Store do not provide (Windows 8.1 JavaScript apps that need WinJS) cannot install; the store says which framework is missing.
 - Whether an installed app runs is up to wine-uwp: see its compatibility notes. Calculator, Solitaire Collection, Media Player and Feedback Hub are known to work.
 

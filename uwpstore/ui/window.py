@@ -102,6 +102,9 @@ class StoreWindow(Adw.ApplicationWindow):
         self.search_button = Gtk.ToggleButton(icon_name="system-search-symbolic", tooltip_text="Search")
         header.pack_start(self.search_button)
         header.pack_end(self._menu_button())
+        from .util import run_async
+        from .. import desktop
+        run_async(desktop.sync, lambda _n: None, lambda _e: None)   # menu entries for apps installed elsewhere
         self.account_button = AccountButton(self.toast)
         header.pack_end(self.account_button)
         header.pack_end(DownloadsButton())
@@ -176,7 +179,7 @@ class StoreWindow(Adw.ApplicationWindow):
             return
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
-        view.set_content(pages.ProductPage(product_id, self.toast, self.open_settings))
+        view.set_content(pages.ProductPage(product_id, self.toast, self.open_settings, self.open_product))
         self.nav.push(Adw.NavigationPage(child=view, title=title or "Product"))
 
     def open_list(self, title: str, section: catalog.Section) -> None:

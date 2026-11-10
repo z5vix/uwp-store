@@ -82,6 +82,7 @@ def choose_framework(resolution: fe3.Resolution, dep: packages.Dependency, arch:
 
 
 STORE_PRODUCT_ID = "9WZDNCRFJBMP"      # Microsoft Store itself (apps.microsoft.com/detail/9wzdncrfjbmp)
+XBOX_APP_PRODUCT_ID = "9MV0B5HZVK9Z"   # the Xbox app, which installs Xbox PC (GDK) games
 
 
 @dataclass
@@ -168,6 +169,11 @@ class Installer:
                 self._install(job)
                 job.state = "done"
                 job.stage = "Installed"
+                try:
+                    from . import desktop
+                    desktop.sync()
+                except OSError as exc:      # a menu entry is a convenience; the install itself succeeded
+                    job.log.append(f"start-menu entry: {exc}")
             except (InstallError, fe3.DeliveryError, net.NetError, packages.PackageError,
                     runtimes.RuntimeError_, OSError) as exc:
                 job.state = "cancelled" if job.cancel_requested else "failed"

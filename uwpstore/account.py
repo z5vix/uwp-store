@@ -184,6 +184,44 @@ def store_ticket() -> str | None:
         return None
 
 
+# ---- what the account owns -------------------------------------------------------------------------
+
+COLLECTIONS_SCOPE = "service::collections.mp.microsoft.com::MBI_SSL"
+COLLECTIONS_URL = "https://collections.mp.microsoft.com/v7.0/collections/query"
+_owned: dict[str, tuple[bool, float]] = {}
+
+
+def owns(product_id: str) -> bool:
+    """Does the signed-in account own the product (purchase, free claim or bundle)? As Wine-UWP's winexboxauth asks:
+    collections.mp.microsoft.com with the account as beneficiary. Subscription access (Game Pass) is not ownership."""
+    if not signed_in():
+        return False
+    product_id = product_id.upper()
+    with _lock:
+        cached = _owned.get(product_id)
+        if cached and cached[1] > time.time():
+            return cached[0]
+        refresh = _load_refresh()
+        status, data = _form(TOKEN_URL, {"grant_type": "refresh_token", "client_id": CLIENT_ID,
+                                         "scope": COLLECTIONS_SCOPE, "refresh_token": refresh})
+        if status != 200 or not data.get("access_token"):
+            raise AccountError(data.get("error_description") or "Could not check your licences")
+        if data.get("refresh_token") and data["refresh_token"] != refresh:
+            _store_refresh(data["refresh_token"])
+        ticket, puid = data["access_token"], data.get("user_id", "")
+    body = {"beneficiaries": [{"identityType": "msa", "identityValue": ticket, "localTicketReference": puid}],
+            "maxPageSize": 25, "market": settings.load().get("market") or "US",
+            "productSkuIds": [{"productId": product_id}], "validityType": "Valid"}
+    status, raw = net.post(COLLECTIONS_URL, json.dumps(body).encode(),
+                           {"Content-Type": "application/json", "Authorization": f'WLID1.0="t={ticket}"'})
+    if status != 200:
+        raise AccountError(f"The licence service answered HTTP {status}")
+    owned = bool(json.loads(raw or b"{}").get("items"))
+    with _lock:
+        _owned[product_id] = (owned, time.time() + 600)
+    return owned
+
+
 # ---- Xbox Live profile -------------------------------------------------------------------------------
 
 def _xbl_post(url: str, body: dict) -> dict:
@@ -232,6 +270,7 @@ def sign_out() -> None:
     global _profile
     with _lock:
         _access.clear()
+        _owned.clear()
         _profile = None
         _store_refresh("")
     settings.save(msa_profile={})

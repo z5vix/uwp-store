@@ -15,6 +15,7 @@ DEFAULTS = {
     "iso_path": "",               # the user's own Windows 11 ISO; never copied or shipped
     "windows_tree": "",           # a harvested tree to adopt instead of harvesting again
     "keep_downloads": False,
+    "app_shortcuts": True,        # put installed apps in the start menu
     "msa_refresh_token": "",     # only when no keyring is available (file is mode 0600)
     "msa_profile": {},            # gamertag/xuid of the signed-in account; never tokens
 }

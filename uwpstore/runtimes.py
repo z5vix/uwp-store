@@ -59,6 +59,12 @@ class InstalledApp:
     shortcut: str = ""            # win32: the Start-menu shortcut that launches it
     icon_path: str = ""           # the package's own list icon, when it has one
 
+    in_app_list: bool = True       # false for helper packages the manifest keeps off the Start menu
+
+    @property
+    def launchable(self) -> bool:
+        return self.kind == "win32" or bool(self.exe)
+
     @property
     def version(self) -> str:
         """The package version from Name_Version_Arch_Resource_PublisherId ("" for win32 apps)."""
@@ -225,6 +231,7 @@ class Runtime:
                 stage = identity.parent.name
                 if stage.endswith((".new", ".old")) or stage == "frameworks":
                     continue
+                fix_launch(identity.parent)
                 values = _read_env(identity)
                 app = InstalledApp(
                     stage=stage,
@@ -237,6 +244,7 @@ class Runtime:
                 )
                 _apply_meta(app, self.meta_dir / f"{stage}.json")
                 app.icon_path = _package_icon(identity.parent)
+                app.in_app_list = app.family_name in LAUNCH_FIXES or not _hidden_from_app_list(identity.parent, app.aumid)
                 out.append(app)
         for meta in sorted(self.meta_dir.glob("win32-*.json")):
             data = _load_json(meta)
@@ -246,6 +254,11 @@ class Runtime:
                                         product_id=data.get("product_id", ""), logo_url=data.get("logo_url", ""),
                                         kind="win32", shortcut=data["shortcut"]))
         return out
+
+    def activate(self, uri: str) -> None:
+        """Hand a URI to the installed app that owns its scheme (starting the app if needed)."""
+        subprocess.Popen(self.command("activate", uri), env=self.env(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     def find_app(self, family_name: str = "", product_id: str = "") -> InstalledApp | None:
         for app in self.apps():
@@ -299,6 +312,36 @@ class Runtime:
         path.write_text(json.dumps(data, indent=2))
 
 
+# Packages whose first <Application> is only a launcher that hands off through a URI scheme wine-uwp does not route.
+# The Xbox app (2612+) starts XboxPcAppCE.exe, which opens msxboxl:/// for the real app, Microsoft.Xbox.AppL.
+LAUNCH_FIXES = {
+    "Microsoft.GamingApp_8wekyb3d8bbwe": ("Microsoft.Xbox.AppL", "XboxPcApp.exe"),
+}
+XBOX_APP_FAMILY = "Microsoft.GamingApp_8wekyb3d8bbwe"
+
+
+def fix_launch(stage: Path) -> bool:
+    """Point a stage's identity.env at the package's real entry point (see LAUNCH_FIXES). True if changed."""
+    identity = stage / "identity.env"
+    values = _read_env(identity)
+    fix = LAUNCH_FIXES.get(values.get("WINE_UWP_PACKAGE_FAMILY_NAME", ""))
+    if not fix or not (stage / fix[1]).is_file():
+        return False
+    family = values["WINE_UWP_PACKAGE_FAMILY_NAME"]
+    aumid = f"{family}!{fix[0]}"
+    if values.get("WINE_UWP_AUMID") == aumid and values.get("UWP_EXE") == fix[1]:
+        return False
+    lines = []
+    for line in identity.read_text().splitlines():
+        if line.startswith("export WINE_UWP_AUMID="):
+            line = f"export WINE_UWP_AUMID={aumid}"
+        elif line.startswith("export UWP_EXE="):
+            line = f"export UWP_EXE='{fix[1]}'"
+        lines.append(line)
+    identity.write_text("\n".join(lines) + "\n")
+    return True
+
+
 def _read_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(errors="replace").splitlines():
@@ -324,6 +367,29 @@ def _load_json(path: Path) -> dict:
 _ICON_ATTR = re.compile(r'Square44x44Logo="([^"]+)"|<Logo>([^<]+)</Logo>')
 
 
+def _ci_file(root: Path, relative: str) -> Path | None:
+    """root/relative, matching each part case-insensitively (manifests say "assets", packages ship "Assets")."""
+    current = root
+    for part in [p for p in relative.split("/") if p]:
+        exact = current / part
+        if exact.exists():
+            current = exact
+            continue
+        try:
+            lowered = {child.name.lower(): child for child in current.iterdir()}
+        except OSError:
+            return None
+        found = lowered.get(part.lower())
+        if found is None:
+            return None
+        current = found
+    return current
+
+
+_ICON_VARIANTS = ("targetsize-256_altform-unplated", "targetsize-256", "targetsize-96_altform-unplated", "targetsize-96",
+                  "targetsize-48_altform-unplated", "targetsize-48", "scale-400", "scale-200", "scale-150", "scale-100", "")
+
+
 def _package_icon(package_dir: Path) -> str:
     """The best rendition of the manifest's list icon (Square44x44Logo, else Logo), as a file path."""
     try:
@@ -332,13 +398,34 @@ def _package_icon(package_dir: Path) -> str:
         return ""
     for match in _ICON_ATTR.finditer(manifest):
         relative = (match.group(1) or match.group(2)).replace("\\", "/")
-        base = package_dir / relative
-        stem, suffix = base.stem, base.suffix or ".png"
-        for variant in ("targetsize-48_altform-unplated", "targetsize-48", "scale-200", "scale-150", "scale-100", ""):
-            candidate = base.with_name(f"{stem}.{variant}{suffix}" if variant else base.name)
-            if candidate.is_file():
+        folder_rel, _, name = relative.rpartition("/")
+        folder = _ci_file(package_dir, folder_rel) if folder_rel else package_dir
+        if folder is None or not folder.is_dir():
+            continue
+        stem, dot, suffix = name.rpartition(".")
+        stem, suffix = (stem, "." + suffix) if dot else (name, ".png")
+        names = {child.name.lower(): child for child in folder.iterdir()}
+        for variant in _ICON_VARIANTS:
+            candidate = names.get((f"{stem}.{variant}{suffix}" if variant else f"{stem}{suffix}").lower())
+            if candidate and candidate.is_file():
                 return str(candidate)
     return ""
+
+
+_APPLICATION = re.compile(r"<Application\b[^>]*\bId=\"([^\"]+)\"(.*?)</Application>", re.S)
+
+
+def _hidden_from_app_list(package_dir: Path, aumid: str) -> bool:
+    """Whether the manifest keeps this application out of the Start menu (AppListEntry="none"), as Windows does."""
+    app_id = aumid.partition("!")[2]
+    try:
+        manifest = (package_dir / "AppxManifest.xml").read_text(errors="replace")
+    except OSError:
+        return False
+    for match in _APPLICATION.finditer(manifest):
+        if match.group(1) == app_id:
+            return bool(re.search(r'<[\w:]*VisualElements\b[^>]*AppListEntry="none"', match.group(2)))
+    return False
 
 
 def _apply_meta(app: InstalledApp, path: Path) -> None:

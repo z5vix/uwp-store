@@ -9,7 +9,7 @@ from typing import Callable, Iterator
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from .. import account, catalog, installer, net, packages, paths, runtimes, settings
+from .. import account, catalog, desktop, installer, net, packages, paths, runtimes, settings
 from . import account as ui_account
 from .util import human_size, run_async
 
@@ -223,6 +223,12 @@ class SettingsDialog(Adw.PreferencesDialog):
         region.add(locale)
         store.add(region)
         storage = Adw.PreferencesGroup(title="Storage")
+        shortcuts = Adw.SwitchRow(title="Add installed apps to the start menu",
+                                  subtitle="One menu entry per app, removed again when it is uninstalled",
+                                  active=bool(cfg.get("app_shortcuts", True)))
+        shortcuts.connect("notify::active", lambda row, _p: (self._save(app_shortcuts=row.get_active()),
+                                                              run_async(desktop.sync, lambda n: None, lambda e: None)))
+        storage.add(shortcuts)
         keep = Adw.SwitchRow(title="Keep downloaded packages", subtitle=str(paths.downloads_dir()),
                              active=bool(cfg.get("keep_downloads")))
         keep.connect("notify::active", lambda row, _p: self._save(keep_downloads=row.get_active()))

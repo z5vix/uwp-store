@@ -170,6 +170,16 @@ class Product:
         return self.price.lower() in ("free", "free+", "$0.00", "")
 
     @property
+    def bundled_ids(self) -> list[str]:
+        """Products a bundle includes (Minecraft: Java & Bedrock -> the Launcher and Bedrock)."""
+        out: list[str] = []
+        for sku in self.raw.get("Skus") or []:
+            for pid in sku.get("BundledSkus") or []:
+                if isinstance(pid, str) and pid not in out and pid != self.product_id:
+                    out.append(pid)
+        return out
+
+    @property
     def runs_on_desktop(self) -> bool:
         return not self.allowed_platforms or any(p in ("Windows.Desktop", "Windows.Universal") for p in self.allowed_platforms)
 

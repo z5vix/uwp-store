@@ -28,6 +28,8 @@ def cli(argv: list[str]) -> int:
     sub.add_parser("apps", help="list installed apps")
     r = sub.add_parser("run", help="run an installed app (stage name or product id)")
     r.add_argument("app")
+    r.add_argument("--runtime", default="", help="only look in this runtime")
+    sub.add_parser("menu", help="add installed apps to the start menu (and remove stale entries)")
     args = parser.parse_args(argv)
 
     if args.cmd == "search":
@@ -90,8 +92,13 @@ def cli(argv: list[str]) -> int:
     elif args.cmd == "apps":
         for app in runtimes.all_apps():
             print(f"{app.runtime_id:24} {app.stage:28} {app.title}")
+    elif args.cmd == "menu":
+        from . import desktop
+        print(f"{desktop.sync()} start-menu entries")
     elif args.cmd == "run":
         for rt in runtimes.discover():
+            if args.runtime and rt.id != args.runtime:
+                continue
             for app in rt.apps():
                 if args.app in (app.stage, app.product_id):
                     rt.run(app)
