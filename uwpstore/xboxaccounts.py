@@ -143,6 +143,31 @@ def switch(runtime: runtimes.Runtime, xuid: str) -> bool:
     return True
 
 
+def adopt(runtime: runtimes.Runtime, xuid: str) -> bool:
+    """Before the store signs this account in itself: True when its sign-in is already in place (from the vault or
+    because it is the current one); False when the caller must import it. Unlike switch, it never empties the slot,
+    because the file also holds the prefix's Xbox device identity, and a new one takes another device slot."""
+    if signed_in_as(runtime) == xuid and auth_file(runtime).is_file():
+        return True
+    if busy(runtime):
+        raise XboxAccountError("Close the Xbox app (and its games) first: it is signed in as another account")
+    _save_current(runtime)
+    saved = vault(runtime) / f"{xuid}.bin"
+    if saved.is_file():
+        target = auth_file(runtime)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(saved, target)
+        _marker(runtime).write_text(json.dumps({"xuid": xuid, "time": time.time()}))
+        return True
+    return False
+
+
+def mark_signed_in(runtime: runtimes.Runtime, xuid: str) -> None:
+    """The store put this account's sign-in in place itself (gdk.sign_in): record it, and save its vault copy."""
+    _marker(runtime).write_text(json.dumps({"xuid": xuid, "time": time.time()}))
+    _save_current(runtime)
+
+
 def sign_out_here(runtime: runtimes.Runtime) -> None:
     """Leave the Xbox app signed out in this runtime (the account's sign-in stays saved for later)."""
     if busy(runtime):

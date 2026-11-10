@@ -1,0 +1,693 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: z5vix <z5vix@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:55:00 -0500
+Subject: [PATCH] UWP Store: Minecraft start-up fixes, GDK installs and title sign-in from the store
+
+- kernelbase/ntdll: ResolveDelayLoadsFromDll (LdrResolveDelayLoadsFromDll); Minecraft calls it at start.
+- windows.devices.enumeration: CreateFromIdAsync, with the local machine container always present.
+- windows.ui.core.textinput: CoreInputView answers "no touch keyboard" instead of E_NOTIMPL.
+- combase: ordinal 133 RoIsASTAWorkScheduledAtPriorityOrHigher takes one argument and returns BOOL, as Windows'.
+- xgameruntime: XSystemGetAnalyticsInfo (class b884675d...), which returns its struct by value; the generic stub
+  gave GDK games a NULL and Minecraft crashed at start.
+- winexboxauth:
+  * XboxAuthImportRefreshToken: the store signs the prefix in with its own Microsoft account (same client id) and
+    installs GDK titles without the Xbox app.
+  * XboxAuthImportClientRefreshToken / XboxAuthHasClient: a game's own MSAAppId sign-in, run by the store as a
+    device-code sign-in once per account; kept with the account it belongs to.
+  * sisu_client_for: MSAAppIds that only Windows' account broker redeems (SISU 401) get their title tokens through
+    the same game's SISU client (Minecraft for Windows 0000000040159362 -> 0000000048183522), and title endpoints
+    come from that client's title, which maps *.playfabapi.com to Minecraft's PlayFab relying party.
+  * XboxAuthGetTokenAndSignature: success with an empty token for a URL with no relying party (it ran strlen on
+    NULL and crashed the caller).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -3995,6 +3995,45 @@
+     }
+ }
+ 
++static void * WINAPI delayload_resolve_all_failed( const char *dll, const char *function )
++{
++    return NULL;
++}
++
++/****************************************************************************
++ *              LdrResolveDelayLoadsFromDll   (NTDLL.@)
++ *
++ * Bind every delay-loaded import that the module at base takes from target now (Minecraft for Windows calls
++ * kernelbase's ResolveDelayLoadsFromDll at start-up). Imports that cannot be bound stay lazy.
++ */
++NTSTATUS WINAPI LdrResolveDelayLoadsFromDll( void *base, const char *target, ULONG flags )
++{
++    const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
++    IMAGE_THUNK_DATA *iat, *names;
++    NTSTATUS status = STATUS_DLL_NOT_FOUND;
++    ULONG size;
++
++    TRACE( "(%p, %s, 0x%08lx)\n", base, debugstr_a(target), flags );
++
++    if (!base || !target) return STATUS_INVALID_PARAMETER;
++    if (!(desc = RtlImageDirectoryEntryToData( base, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size )))
++        return STATUS_DLL_NOT_FOUND;
++
++    for (; desc->DllNameRVA; desc++)
++    {
++        if (_stricmp( get_rva( base, desc->DllNameRVA ), target )) continue;
++        status = STATUS_SUCCESS;
++        iat = get_rva( base, desc->ImportAddressTableRVA );
++        names = get_rva( base, desc->ImportNameTableRVA );
++        for (; names->u1.AddressOfData; iat++, names++)
++        {
++            if (!LdrResolveDelayLoadedAPI( base, desc, NULL, delayload_resolve_all_failed, iat, 0 ))
++                status = STATUS_PROCEDURE_NOT_FOUND;
++        }
++    }
++    return status;
++}
++
+ /******************************************************************
+  *		LdrShutdownProcess (NTDLL.@)
+  *
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -114,6 +114,7 @@
+ @ stdcall LdrRegisterDllNotification(long ptr ptr ptr)
+ @ stdcall LdrRemoveDllDirectory(ptr)
+ @ stdcall LdrResolveDelayLoadedAPI(ptr ptr ptr ptr ptr long)
++@ stdcall LdrResolveDelayLoadsFromDll(ptr str long)
+ @ stub LdrSetAppCompatDllRedirectionCallback
+ @ stdcall LdrSetDefaultDllDirectories(long)
+ @ stdcall LdrSetDllDirectory(ptr)
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1404,7 +1404,7 @@
+ @ stdcall ResetWriteWatch(ptr long)
+ @ stdcall ResizePseudoConsole(ptr long)
+ @ stdcall -import ResolveDelayLoadedAPI(ptr ptr ptr ptr ptr long) LdrResolveDelayLoadedAPI
+-# @ stub ResolveDelayLoadsFromDll
++@ stdcall -import ResolveDelayLoadsFromDll(ptr str long) LdrResolveDelayLoadsFromDll
+ @ stdcall ResolveLocaleName(wstr ptr long)
+ @ stdcall RestoreLastError(long) ntdll.RtlRestoreLastWin32Error
+ @ stdcall ResumeThread(long)
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -39,6 +39,7 @@
+     struct aqs_expr *expr;
+     DEVPROPCOMPKEY *prop_keys;
+     ULONG prop_keys_len;
++    WCHAR *id; /* CreateFromIdAsync */
+     LONG ref;
+ };
+ 
+@@ -82,6 +83,7 @@
+     {
+         free_aqs_expr( impl->expr );
+         free( impl->prop_keys );
++        free( impl->id );
+         free( impl );
+     }
+     return ref;
+@@ -722,19 +724,119 @@
+ 
+ DEFINE_IINSPECTABLE( device_statics, IDeviceInformationStatics, struct device_information_statics, IActivationFactory_iface );
+ 
++/* the device container that stands for this PC; it always exists on Windows */
++static const WCHAR local_machine_container[] = L"{00000000-0000-0000-FFFF-FFFFFFFFFFFF}";
++
++static HRESULT create_from_id_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
++{
++    struct devquery_params *params;
++    const DEVPROPERTY *props = NULL;
++    IDeviceInformation *info;
++    DEV_OBJECT obj = {0};
++    ULONG len = 0;
++    HRESULT hr;
++
++    TRACE( "invoker %p, param %p, result %p, called_async %d\n", invoker, param, result, called_async );
++
++    if (!called_async) return STATUS_PENDING;
++
++    params = impl_from_IUnknown( param );
++    hr = DevGetObjectProperties( params->type, params->id, DevQueryFlagNone, params->prop_keys_len, params->prop_keys,
++                                 &len, &props );
++    if (FAILED(hr))
++    {
++        if (wcsicmp( params->id, local_machine_container )) return hr;
++        /* Minecraft for Windows asks for this PC's container at start-up and throws when it is missing */
++        WARN( "no properties for the local machine container (%#lx); returning it without them\n", hr );
++        props = NULL;
++        len = 0;
++    }
++    obj.ObjectType = params->type;
++    obj.pszObjectId = params->id;
++    obj.cPropertyCount = len;
++    obj.pProperties = props;
++    hr = device_information_create( &obj, &info );
++    if (props) DevFreeObjectProperties( len, props );
++    if (FAILED(hr)) return hr;
++
++    result->vt = VT_UNKNOWN;
++    result->punkVal = (IUnknown *)info;
++    return S_OK;
++}
++
++static HRESULT create_from_id( IUnknown *invoker, HSTRING id, IIterable_HSTRING *additional_properties,
++                               DeviceInformationKind kind, IAsyncOperation_DeviceInformation **op )
++{
++    static const DEV_OBJECT_TYPE kind_type[] = {
++        DevObjectTypeDeviceInterfaceDisplay, /* Unknown: an interface id, as IDeviceInformationStatics takes */
++        DevObjectTypeDeviceInterfaceDisplay,
++        DevObjectTypeDeviceContainerDisplay,
++        DevObjectTypeDevice,
++        DevObjectTypeDeviceInterfaceClass,
++        DevObjectTypeAEP,
++        DevObjectTypeAEPContainer,
++        DevObjectTypeAEPService,
++        DevObjectTypeDevicePanel,
++    };
++    const DEVPROPCOMPKEY device_iface_default_props[] = {
++        { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
++        { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
++    };
++    struct devquery_params *impl;
++    DEVPROPCOMPKEY *prop_keys = NULL;
++    ULONG prop_keys_len = 0;
++    const WCHAR *raw;
++    IUnknown *params;
++    UINT32 raw_len;
++    HRESULT hr;
++
++    if (!op) return E_POINTER;
++    *op = NULL;
++    raw = WindowsGetStringRawBuffer( id, &raw_len );
++    if (!raw_len) return E_INVALIDARG;
++    if (kind >= ARRAY_SIZE( kind_type )) return E_INVALIDARG;
++
++    if (kind <= DeviceInformationKind_DeviceInterface &&
++        FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props,
++                                          ARRAY_SIZE( device_iface_default_props ) ))) return hr;
++    if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties )))
++    {
++        free( prop_keys );
++        return hr;
++    }
++    if (FAILED(hr = devquery_params_create( kind_type[kind], NULL, prop_keys, prop_keys_len, &params )))
++    {
++        free( prop_keys );
++        return hr;
++    }
++    impl = impl_from_IUnknown( params );
++    if (!(impl->id = malloc( (raw_len + 1) * sizeof(WCHAR) )))
++    {
++        IUnknown_Release( params );
++        return E_OUTOFMEMORY;
++    }
++    memcpy( impl->id, raw, raw_len * sizeof(WCHAR) );
++    impl->id[raw_len] = 0;
++
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformation, invoker, params, create_from_id_async,
++                                             (IAsyncOperation_IInspectable **)op );
++    IUnknown_Release( params );
++    return hr;
++}
++
+ static HRESULT WINAPI device_statics_CreateFromIdAsync( IDeviceInformationStatics *iface, HSTRING id,
+                                                         IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, op %p stub!\n", iface, debugstr_hstring(id), op );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, id %s, op %p\n", iface, debugstr_hstring(id), op );
++    return create_from_id( (IUnknown *)iface, id, NULL, DeviceInformationKind_Unknown, op );
+ }
+ 
+ static HRESULT WINAPI device_statics_CreateFromIdAsyncAdditionalProperties( IDeviceInformationStatics *iface, HSTRING id,
+                                                                             IIterable_HSTRING *additional_properties,
+                                                                             IAsyncOperation_DeviceInformation **op )
+ {
+-    FIXME( "iface %p, id %s, additional_properties %p, op %p stub!\n", iface, debugstr_hstring(id), additional_properties, op );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, id %s, additional_properties %p, op %p\n", iface, debugstr_hstring(id), additional_properties, op );
++    return create_from_id( (IUnknown *)iface, id, additional_properties, DeviceInformationKind_Unknown, op );
+ }
+ 
+ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+@@ -939,9 +1041,9 @@
+                                                          IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                          IAsyncOperation_DeviceInformation **async_operation )
+ {
+-    FIXME( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p stub!\n",
+-            iface, debugstr_hstring( device_id ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, device_id %s, additional_properties %p, kind %u, async_operation %p\n",
++           iface, debugstr_hstring( device_id ), additional_properties, kind, async_operation );
++    return create_from_id( (IUnknown *)iface, device_id, additional_properties, kind, async_operation );
+ }
+ 
+ static HRESULT WINAPI device_statics2_FindAllAsync( IDeviceInformationStatics2 *iface, HSTRING filter,
+--- a/dlls/windows.ui.core.textinput/main.c
++++ b/dlls/windows.ui.core.textinput/main.c
+@@ -130,7 +130,7 @@
+                                                                EventRegistrationToken token)
+ {
+     FIXME("iface %p, token %I64x stub!\n", iface, token.value);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view_GetCoreInputViewOcclusions(ICoreInputView *iface,
+@@ -195,14 +195,15 @@
+                                                                               EventRegistrationToken *token)
+ {
+     FIXME("iface %p, handler %p, token %p stub!\n", iface, handler, token);
+-    return E_NOTIMPL;
++    token->value = 0xdeadbeef; /* no touch keyboard here: the event never fires */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view2_remove_XYFocusTransferringFromPrimaryView(ICoreInputView2 *iface,
+                                                                                  EventRegistrationToken token)
+ {
+     FIXME("iface %p, token %I64x stub!\n", iface, token.value);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view2_add_XYFocusTransferredToPrimaryView(ICoreInputView2 *iface,
+@@ -210,14 +211,15 @@
+                                                                            EventRegistrationToken *token)
+ {
+     FIXME("iface %p, handler %p, token %p stub!\n", iface, handler, token);
+-    return E_NOTIMPL;
++    token->value = 0xdeadbeef; /* no touch keyboard here: the event never fires */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view2_remove_XYFocusTransferredToPrimaryView(ICoreInputView2 *iface,
+                                                                               EventRegistrationToken token)
+ {
+     FIXME("iface %p, token %I64x stub!\n", iface, token.value);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view2_TryTransferXYFocusToPrimaryView(ICoreInputView2 *iface,
+@@ -227,7 +229,8 @@
+ {
+     FIXME("iface %p, origin (%f,%f %fx%f), direction %d, result %p stub!\n", iface, origin.X,
+           origin.Y, origin.Width, origin.Height, direction, result);
+-    return E_NOTIMPL;
++    *result = FALSE; /* no touch keyboard to show, hide or move focus to */
++    return S_OK;
+ }
+ 
+ static const struct ICoreInputView2Vtbl core_input_view2_vtbl =
+@@ -252,7 +255,8 @@
+ static HRESULT WINAPI core_input_view3_TryShow(ICoreInputView3 *iface, boolean *result)
+ {
+     FIXME("iface %p, result %p stub!\n", iface, result);
+-    return E_NOTIMPL;
++    *result = FALSE; /* no touch keyboard to show, hide or move focus to */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view3_TryShowWithKind(ICoreInputView3 *iface,
+@@ -260,13 +264,15 @@
+                                                        boolean *result)
+ {
+     FIXME("iface %p, type %d, result %p stub!\n", iface, type, result);
+-    return E_NOTIMPL;
++    *result = FALSE; /* no touch keyboard to show, hide or move focus to */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view3_TryHide(ICoreInputView3 *iface, boolean *result)
+ {
+     FIXME("iface %p, result %p stub!\n", iface, result);
+-    return E_NOTIMPL;
++    *result = FALSE; /* no touch keyboard to show, hide or move focus to */
++    return S_OK;
+ }
+ 
+ static const struct ICoreInputView3Vtbl core_input_view3_vtbl =
+@@ -291,14 +297,15 @@
+                                                               EventRegistrationToken *token)
+ {
+     FIXME("iface %p, handler %p, token %p stub!\n", iface, handler, token);
+-    return E_NOTIMPL;
++    token->value = 0xdeadbeef; /* no touch keyboard here: the event never fires */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view4_remove_PrimaryViewShowing(ICoreInputView4 *iface,
+                                                                  EventRegistrationToken token)
+ {
+     FIXME("iface %p, token %I64x stub!\n", iface, token.value);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI core_input_view4_add_PrimaryViewHiding(ICoreInputView4 *iface,
+@@ -314,7 +321,7 @@
+                                                                 EventRegistrationToken token)
+ {
+     FIXME("iface %p, token %I64x stub!\n", iface, token.value);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static const struct ICoreInputView4Vtbl core_input_view4_vtbl =
+--- a/dlls/combase/asta.c
++++ b/dlls/combase/asta.c
+@@ -171,11 +171,12 @@
+ }
+ 
+ /* ordinal 133 */
+-HRESULT WINAPI RoIsASTAWorkScheduledAtPriorityOrHigher( DWORD priority, BOOL *scheduled )
++/* Windows' combase takes the priority alone and returns the answer (it reads only ecx and returns 0 or 1); a
++ * second, pointer argument made Minecraft's dispatcher write through whatever was left in rdx */
++BOOL WINAPI RoIsASTAWorkScheduledAtPriorityOrHigher( DWORD priority )
+ {
+-    FIXME( "%lu, %p: semi-stub\n", priority, scheduled );
+-    if (scheduled) *scheduled = FALSE;
+-    return S_OK;
++    FIXME( "%lu: semi-stub\n", priority );
++    return FALSE;
+ }
+ 
+ /* ordinal 134: Windows.UI.Xaml initializes the UI thread as an application STA. */
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -366,7 +366,7 @@
+ 111 stdcall CoHandlePriorityEventsFromMessagePump()
+ 120 stdcall CoRegisterForApartmentShutdown(ptr ptr ptr) RoRegisterForApartmentShutdown
+ 122 stdcall CoGetApartmentIdentifier(ptr) RoGetApartmentIdentifier
+-133 stdcall RoIsASTAWorkScheduledAtPriorityOrHigher(long ptr)
++133 stdcall RoIsASTAWorkScheduledAtPriorityOrHigher(long)
+ 134 stdcall RoInitializeASTA()
+ 147 stdcall RoActivateInstanceAsUser(ptr ptr ptr)
+ 148 stdcall RoGetActivationFactoryAsUser(ptr ptr ptr ptr)
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -687,6 +687,52 @@
+ 
+ static gdk_object stub_object = { stub_vtbl };
+ 
++/*
++ * XSystemGetAnalyticsInfo's class. Its first method returns an XSystemAnalyticsInfo by value: the caller passes the
++ * hidden result pointer after the object and copies 0x90 bytes from the pointer returned in rax. The stub object's
++ * FALSE there was a NULL that Minecraft for Windows (1.26) read at start-up.
++ */
++typedef struct
++{
++    UINT16 major, minor, build, revision;
++} xversion;
++
++typedef struct
++{
++    xversion os_version;
++    xversion hosting_os_version;
++    char family[64];
++    char form[64];
++} xsystem_analytics_info;
++
++static xsystem_analytics_info * WINAPI analytics_GetAnalyticsInfo( gdk_object *iface, xsystem_analytics_info *info )
++{
++    OSVERSIONINFOW os = { sizeof(os) };
++
++    memset( info, 0, sizeof(*info) );
++    GetVersionExW( &os );
++    info->os_version.major = os.dwMajorVersion;
++    info->os_version.minor = os.dwMinorVersion;
++    info->os_version.build = os.dwBuildNumber;
++    info->hosting_os_version = info->os_version;
++    strcpy( info->family, "Windows.Desktop" );
++    strcpy( info->form, "Desktop" );
++    TRACE( "%u.%u.%u %s %s\n", info->os_version.major, info->os_version.minor, info->os_version.build,
++           info->family, info->form );
++    return info;
++}
++
++static const void *const analytics_vtbl[] =
++{
++    stub_QueryInterface, stub_AddRef, stub_Release,
++    analytics_GetAnalyticsInfo,
++    stub_hresult, stub_hresult, stub_hresult, stub_hresult,
++};
++
++static gdk_object analytics_object = { analytics_vtbl };
++
++static const GUID CLSID_XSystemAnalyticsImpl = {0xb884675d,0xb738,0x4a9c,{0x81,0x5d,0x9a,0x9a,0x1e,0x0c,0x6c,0x9b}};
++
+ static const GUID CLSID_XPackageImpl = {0xaf406016,0xe850,0x4aa8,{0xa8,0x8d,0x2f,0x3d,0xcb,0x9d,0xac,0x7e}};
+ static const GUID CLSID_XUserImpl = {0x01acd177,0x91f9,0x4763,{0xa3,0x8e,0xcc,0xbb,0x55,0xce,0x32,0xe0}};
+ static const GUID CLSID_XStoreImpl = {0x0dd112ac,0x7c24,0x448c,{0xb9,0x2b,0x39,0x60,0xfb,0x5b,0xd3,0x0c}};
+@@ -723,6 +769,11 @@
+     if (IsEqualGUID( clsid, &CLSID_XSystemImpl )) return query_xsystem( iid, out );
+     if (IsEqualGUID( clsid, &CLSID_XGameRuntimeFeatureImpl )) return query_xfeature( iid, out );
+     if (IsEqualGUID( clsid, &CLSID_XNetworkingImpl )) return query_xnetworking( iid, out );
++    if (IsEqualGUID( clsid, &CLSID_XSystemAnalyticsImpl ))
++    {
++        *out = &analytics_object;
++        return S_OK;
++    }
+     /* any IID: GdkSupport often passes the coclass's UUID as the IID */
+     *out = &stub_object;
+     return S_OK;
+--- a/dlls/winexboxauth/auth.c
++++ b/dlls/winexboxauth/auth.c
+@@ -981,6 +981,23 @@
+     return S_OK;
+ }
+ 
++/* Titles whose MicrosoftGame.Config MSAAppId Windows only redeems through the system account broker (WAM): SISU
++ * answers 401 for it. The same game's mobile MSA client gets the title's Xbox Live tokens through SISU instead (the
++ * PlayFab title behind Minecraft is shared by every Bedrock platform), so the device-code sign-in and SISU use that
++ * client, and the title binding counts for the TitleId the game asked for. */
++static const struct { const char *config_app, *sisu_app; } sisu_aliases[] =
++{
++    { "0000000040159362", "0000000048183522" },  /* Minecraft for Windows (GDK) -> Minecraft (Android) */
++};
++
++const char *sisu_client_for( const char *msa_app )
++{
++    unsigned i;
++    for (i = 0; msa_app && i < ARRAY_SIZE(sisu_aliases); i++)
++        if (!_stricmp( msa_app, sisu_aliases[i].config_app )) return sisu_aliases[i].sisu_app;
++    return msa_app;
++}
++
+ static BOOL have_title_token( const char *want )
+ {
+     BOOL have;
+@@ -996,6 +1013,7 @@
+ HRESULT ensure_title_identity( const char *msa_app, UINT32 title_id )
+ {
+     char want[32], *msa = NULL, *user_token = NULL, *xsts = NULL, *got;
++    const char *sisu_app;
+     ULONGLONG user_expires, xsts_expires;
+     struct json *answer = NULL;
+     const char *uhs;
+@@ -1011,20 +1029,22 @@
+         LeaveCriticalSection( &account.signin_cs );
+         return S_OK;
+     }
+-    if (FAILED(hr = msa_refresh_for_client( msa_app, MSA_SCOPE, &msa )))
++    sisu_app = sisu_client_for( msa_app );
++    if (FAILED(hr = msa_refresh_for_client( sisu_app, MSA_SCOPE, &msa )))
+     {
+         LeaveCriticalSection( &account.signin_cs );
+-        WARN( "title identity %s/%u: no MSA for client (%#lx); device-code that client once\n", msa_app, title_id, hr );
++        WARN( "title identity %s/%u: no MSA for client %s (%#lx); device-code that client once\n", msa_app, title_id,
++              sisu_app, hr );
+         return hr;
+     }
+     /* PC GDK titles need Win32 device tokens for SISU and the matching XSTS; Android (the Xbox app's default) 401s
+      * here, and a TitleToken minted under Win32 is refused by XSTS with an Android device. */
+     if (strcmp( msa_app, MSA_CLIENT_ID )) SetEnvironmentVariableA( "WINE_UWP_XBOX_DEVICE_TYPE", "Win32" );
+-    hr = xbl_sisu_authorize_app( msa, msa_app, &user_token, &user_expires, &xsts, &xsts_expires, &answer );
++    hr = xbl_sisu_authorize_app( msa, sisu_app, &user_token, &user_expires, &xsts, &xsts_expires, &answer );
+     if (FAILED(hr) && strcmp( msa_app, MSA_CLIENT_ID ))
+     {
+         SetEnvironmentVariableA( "WINE_UWP_XBOX_DEVICE_TYPE", "Android" );
+-        hr = xbl_sisu_authorize_app( msa, msa_app, &user_token, &user_expires, &xsts, &xsts_expires, &answer );
++        hr = xbl_sisu_authorize_app( msa, sisu_app, &user_token, &user_expires, &xsts, &xsts_expires, &answer );
+     }
+     str_wipe_free( msa );
+     if (FAILED(hr))
+@@ -1034,6 +1054,13 @@
+     }
+ 
+     EnterCriticalSection( &account.cs );
++    if (sisu_app != msa_app && account.title_token && *account.title_token)
++    {
++        TRACE( "title identity: %s stands in for %s (SISU tid=%s, title %s)\n", sisu_app, msa_app, S(account.title_tid),
++               want );
++        str_set( &account.title_alias_tid, account.title_tid );
++        str_set( &account.title_tid, want );
++    }
+     if (strcmp( S(account.title_tid), want ))
+     {
+         got = str_dup( account.title_tid );
+@@ -1147,11 +1174,17 @@
+     if (!title_app || !*title_app || !title_id || !strcmp( title_app, MSA_CLIENT_ID )) return E_FAIL;
+     snprintf( want, sizeof(want), "%u", title_id );
+     SetEnvironmentVariableA( "WINE_UWP_XBOX_DEVICE_TYPE", "Win32" );
+-    if (FAILED(hr = msa_refresh_for_client( title_app, MSA_SCOPE, &msa ))) return hr;
+-    hr = xbl_sisu_authorize_app( msa, title_app, user_token, user_expires, xsts, xsts_expires, answer );
++    if (FAILED(hr = msa_refresh_for_client( sisu_client_for( title_app ), MSA_SCOPE, &msa ))) return hr;
++    hr = xbl_sisu_authorize_app( msa, sisu_client_for( title_app ), user_token, user_expires, xsts, xsts_expires,
++                                 answer );
+     str_wipe_free( msa );
+     if (FAILED(hr)) return hr;
+     EnterCriticalSection( &account.cs );
++    if (sisu_client_for( title_app ) != title_app && account.title_token && *account.title_token)
++    {
++        str_set( &account.title_alias_tid, account.title_tid );
++        str_set( &account.title_tid, want );
++    }
+     ok = !strcmp( S(account.title_tid), want ) && account.title_token && *account.title_token;
+     LeaveCriticalSection( &account.cs );
+     if (!ok)
+@@ -1466,7 +1499,13 @@
+         if (status == 200 && *jget( j, "access_token" ))
+         {
+             char *key = refresh_store_key( client );
+-            if (*jget( j, "refresh_token" )) store_update( key, jget( j, "refresh_token" ), NULL );
++            if (*jget( j, "refresh_token" ))
++            {
++                char *user_key = strf( "client_user_%s", client ), *user = store_get( "user_id" );
++                store_update( key, jget( j, "refresh_token" ), user_key, user ? user : "", NULL );
++                free( user );
++                free( user_key );
++            }
+             if (full_signin && !strcmp( key, "refresh_token" ))
+             {
+                 take_msa_tokens( j );
+@@ -1533,6 +1572,82 @@
+     TRACE( "signed out; the stored sign-in is deleted\n" );
+ }
+ 
++/* Sign in with a refresh token for MSA_CLIENT_ID that another program obtained (the store's own Microsoft account
++ * sign-in uses this client): the last account is signed out as by sign_out (the device stays) and the token is saved
++ * like one from the device-code flow. The next token request redeems it. */
++HRESULT WINAPI XboxAuthImportRefreshToken( const char *refresh, const char *user_id )
++{
++    if (!refresh || !*refresh) return E_INVALIDARG;
++    sign_out();
++    EnterCriticalSection( &account.signin_cs );
++    EnterCriticalSection( &account.cs );
++    str_set( &account.refresh_token, refresh );
++    if (user_id && *user_id) str_set( &account.msa_user_id, user_id );
++    LeaveCriticalSection( &account.cs );
++    store_update( "refresh_token", refresh, "user_id", user_id ? user_id : "", NULL );
++    LeaveCriticalSection( &account.signin_cs );
++    TRACE( "refresh token imported\n" );
++    return S_OK;
++}
++
++/* Games whose MicrosoftGame.Config names their own MSAAppId (Minecraft's 0000000040159362) get their title identity
++ * from a refresh token for that client, which only a device-code sign-in for that client gives. Another program that
++ * ran that sign-in (the store) hands the token over here; it is kept like one from sign_in_with_device_code_client,
++ * with the user id of the account it belongs to, so a token left by an earlier account is not taken for this one. */
++static char *client_user_key( const char *client_id )
++{
++    return strf( "client_user_%s", client_id );
++}
++
++HRESULT WINAPI XboxAuthImportClientRefreshToken( const char *client_id, const char *refresh )
++{
++    char *key, *user_key, *user;
++
++    if (!client_id || !*client_id || !refresh || !*refresh) return E_INVALIDARG;
++    account_init();
++    client_id = sisu_client_for( client_id );
++    key = refresh_store_key( client_id );
++    if (!strcmp( key, "refresh_token" ))
++    {
++        free( key );
++        return E_INVALIDARG;            /* the Xbox app's client: XboxAuthImportRefreshToken */
++    }
++    user_key = client_user_key( client_id );
++    user = store_get( "user_id" );
++    store_update( key, refresh, user_key, user ? user : "", NULL );
++    TRACE( "refresh token for client %s imported\n", client_id );
++    free( user );
++    free( user_key );
++    free( key );
++    return S_OK;
++}
++
++/* S_OK when the signed-in account has a refresh token for this client, S_FALSE when it needs the device-code
++ * sign-in for it. */
++HRESULT WINAPI XboxAuthHasClient( const char *client_id )
++{
++    char *key, *user_key, *refresh, *owner, *user;
++    HRESULT hr;
++
++    if (!client_id || !*client_id) return E_INVALIDARG;
++    account_init();
++    client_id = sisu_client_for( client_id );
++    key = refresh_store_key( client_id );
++    user_key = client_user_key( client_id );
++    refresh = store_get( key );
++    owner = store_get( user_key );
++    user = store_get( "user_id" );
++    if (!refresh || !*refresh) hr = S_FALSE;
++    else if (!strcmp( key, "refresh_token" )) hr = S_OK;
++    else hr = (owner && user && !strcmp( owner, user )) ? S_OK : S_FALSE;
++    str_wipe_free( refresh );
++    free( owner );
++    free( user );
++    free( user_key );
++    free( key );
++    return hr;
++}
++
+ /* ---- relying parties: the title endpoints table ---- */
+ 
+ struct endpoint
+@@ -1659,6 +1774,8 @@
+     EnterCriticalSection( &account.cs );
+     skip = title_endpoints_loaded || !endpoints_loaded || !tid || !account.signed_in;
+     if (!skip) title_endpoints_loaded = TRUE;  /* one attempt per process; get_token_for_url comes back here */
++    /* the token speaks for the stand-in client's title (sisu_client_for), whose table title.mgt hands out */
++    if (account.title_alias_tid && *account.title_alias_tid) tid = strtoul( account.title_alias_tid, NULL, 10 );
+     LeaveCriticalSection( &account.cs );
+     if (skip) return;
+ 
+--- a/dlls/winexboxauth/main.c
++++ b/dlls/winexboxauth/main.c
+@@ -149,6 +149,8 @@
+     free( app );
+     if (FAILED(hr)) return hr;
+     if (FAILED(hr = get_token_for_url( url, force != 0, &header, TRUE ))) return hr;
++    /* no relying party for this URL: success with an empty token, as XUserGetTokenAndSignature gives */
++    if (!header && !(header = calloc( 1, 1 ))) return E_OUTOFMEMORY;
+ 
+     need = strlen( header ) + 1;
+     *token_len = need;
+--- a/dlls/winexboxauth/private.h
++++ b/dlls/winexboxauth/private.h
+@@ -168,6 +168,7 @@
+     char *title_token;            /* from SISU; empty when it was refused (then XSTS carries no title claims) */
+     ULONGLONG title_expires;
+     char *title_tid;              /* DisplayClaims.xti.tid of title_token (decimal) */
++    char *title_alias_tid;        /* the tid SISU really gave when another client stands in for the title's MSAAppId */
+     struct xsts *xsts;
+     unsigned xsts_count;
+     /* xui claims of the http://xboxlive.com XSTS token */
+--- a/dlls/winexboxauth/winexboxauth.spec
++++ b/dlls/winexboxauth/winexboxauth.spec
+@@ -3,7 +3,10 @@
+ @ stdcall XboxAuthContentKeys(str str ptr long)
+ @ stdcall XboxAuthGamerPicture(long ptr ptr)
+ @ stdcall XboxAuthGetTokenAndSignature(str str long ptr long ptr long ptr ptr long ptr)
++@ stdcall XboxAuthHasClient(str)
+ @ stdcall XboxAuthHttpGet(str str str ptr ptr ptr)
++@ stdcall XboxAuthImportClientRefreshToken(str str)
++@ stdcall XboxAuthImportRefreshToken(str str)
+ @ stdcall XboxAuthOwnsProduct(str)
+ @ stdcall XboxAuthSelfTest(str str)
+ @ stdcall XboxAuthSetTitleContext(str long)

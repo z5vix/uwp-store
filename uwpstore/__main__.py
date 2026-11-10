@@ -138,6 +138,7 @@ def cli(argv: list[str]) -> int:
                 continue
             for app in rt.apps():
                 if args.app in (app.stage, app.product_id):
+                    _title_signin(rt, app)
                     rt.run(app)
                     return 0
         print("no such app", file=sys.stderr)
@@ -145,6 +146,26 @@ def cli(argv: list[str]) -> int:
     else:
         parser.print_help()
     return 0
+
+
+def _title_signin(rt, app) -> None:
+    """A GDK game that signs in as its own Microsoft client: run that one-time sign-in first (the browser opens with
+    the code filled in, so this also works from a start-menu entry with no terminal)."""
+    import subprocess
+    from . import account, gdk
+    if gdk.redistributables_pending(rt, app.stage):
+        gdk.install_redistributables(rt, app.stage)
+    client = gdk.title_signin_needed(rt, app)
+    if not client:
+        return
+    code = account.start_device_code(client)
+    print(f"{app.title} needs a one-time Microsoft sign-in for its own Xbox Live access.\n"
+          f"Open {code.link} (code {code.user_code}) and approve.", file=sys.stderr)
+    subprocess.Popen(["xdg-open", code.link], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        gdk.import_title_signin(rt, client, account.poll_client_code(code, client))
+    except (account.AccountError, gdk.GdkError) as error:
+        print(f"Sign-in for {app.title} failed: {error}; starting it anyway", file=sys.stderr)
 
 
 def _find_account(account, name: str):

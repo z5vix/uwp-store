@@ -212,8 +212,8 @@ def _form(url: str, fields: dict[str, str]) -> tuple[int, dict]:
         return status, {}
 
 
-def start_device_code() -> DeviceCode:
-    status, data = _form(CONNECT_URL, {"client_id": CLIENT_ID, "scope": SIGNIN_SCOPE, "response_type": "device_code"})
+def start_device_code(client_id: str = CLIENT_ID) -> DeviceCode:
+    status, data = _form(CONNECT_URL, {"client_id": client_id, "scope": SIGNIN_SCOPE, "response_type": "device_code"})
     if status != 200 or not data.get("user_code"):
         raise AccountError(data.get("error_description") or f"login.live.com refused the sign-in request (HTTP {status})")
     return DeviceCode(data["user_code"], data["device_code"], LINK_URL.format(code=data["user_code"]),
@@ -222,6 +222,19 @@ def start_device_code() -> DeviceCode:
 
 def poll_device_code(code: DeviceCode, cancelled: Callable[[], bool] = lambda: False) -> Profile:
     """Wait until the user approves the code in their browser; adds that account (or refreshes it if known)."""
+    data = poll_client_code(code, CLIENT_ID, cancelled)
+    profile = _xbox_profile(data["access_token"])
+    profile.id = profile.xuid or data.get("user_id") or f"account-{int(time.time())}"
+    with _lock:
+        if data.get("refresh_token"):
+            _store_refresh(profile.id, data["refresh_token"])
+        _access[(profile.id, SIGNIN_SCOPE)] = (data["access_token"], time.time() + float(data.get("expires_in") or 3600))
+        _save_account(profile)
+    return profile
+
+
+def poll_client_code(code: DeviceCode, client_id: str, cancelled: Callable[[], bool] = lambda: False) -> dict:
+    """Wait until the user approves a device code for client_id; the token response (nothing is stored)."""
     interval = code.interval
     while time.time() < code.expires_at:
         for _ in range(interval * 10):
@@ -230,19 +243,11 @@ def poll_device_code(code: DeviceCode, cancelled: Callable[[], bool] = lambda: F
             time.sleep(0.1)
         try:
             status, data = _form(TOKEN_URL, {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                                             "client_id": CLIENT_ID, "device_code": code.device_code})
+                                             "client_id": client_id, "device_code": code.device_code})
         except net.NetError:
             continue                                   # transient; keep polling
         if status == 200 and data.get("access_token"):
-            profile = _xbox_profile(data["access_token"])
-            profile.id = profile.xuid or data.get("user_id") or f"account-{int(time.time())}"
-            with _lock:
-                if data.get("refresh_token"):
-                    _store_refresh(profile.id, data["refresh_token"])
-                _access[(profile.id, SIGNIN_SCOPE)] = (data["access_token"],
-                                                       time.time() + float(data.get("expires_in") or 3600))
-                _save_account(profile)
-            return profile
+            return data
         error = data.get("error", "")
         if error == "authorization_pending":
             continue

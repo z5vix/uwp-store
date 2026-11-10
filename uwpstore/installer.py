@@ -222,10 +222,14 @@ class Installer:
         if product.installer.lower() not in ("windowsupdate", ""):
             self._install_win32(job, product, runtime)
             return
-        if not product.category_id:
-            raise InstallError("The Store lists no package for this product.")
         if not runtime.ready():
             raise InstallError(f"{runtime.name} is not set up yet: finish setup in Settings (Windows 11 ISO and prefix).")
+        content_id = catalog.gdk_content_id(product.product_id) if product.is_msixvc else ""
+        if content_id:
+            self._install_gdk(job, product, runtime, content_id)
+            return
+        if not product.category_id:
+            raise InstallError("The Store lists no package for this product.")
 
         self._step(job, "resolving", "Finding packages")
         client = fe3.DeliveryClient(account.store_ticket(job.account_id or None))
@@ -275,6 +279,36 @@ class Installer:
             runtime.remember(app.stage, product_id=product.product_id, title=product.title, logo_url=job.logo_url)
         if not settings.load().get("keep_downloads"):
             main_path.unlink(missing_ok=True)
+
+    def _install_gdk(self, job: Job, product: catalog.Product, runtime: runtimes.Runtime, content_id: str) -> None:
+        """A GDK title (MSIXVC): signed in as the owning account, straight from Xbox Live, no Xbox app."""
+        from . import d3d, gdk
+        if not d3d.provide():
+            raise InstallError("GDK games need DXVK and vkd3d-proton; install GE-Proton or Proton in Steam first, "
+                               "and the store takes them from there")
+        stage_before = {a.stage for a in runtime.apps()}
+        self._step(job, "downloading", f"Preparing {product.title}")
+        try:
+            for line in gdk.install(runtime, product.product_id, content_id, job.account_id,
+                                    cancelled=lambda: job.cancel_requested):
+                job.log.append(line)
+                if line.startswith("STAGE "):
+                    job.stage = line[6:]
+                elif line.startswith("PROGRESS "):
+                    parts = line.split()
+                    if len(parts) == 3:
+                        job.state = "downloading"
+                        job.done, job.total = int(parts[1]), int(parts[2])
+                self._emit(job)
+        except gdk.GdkError as exc:
+            raise InstallError(str(exc)) from exc
+        installed = [a for a in runtime.apps() if a.stage not in stage_before] or \
+            [a for a in runtime.apps() if (runtime.stage_dir / a.stage / gdk.MARKER).is_file()
+             and product.product_id in (runtime.stage_dir / a.stage / gdk.MARKER).read_text()]
+        if not installed:
+            raise InstallError("The installer finished without installing the game; see the log")
+        for app in installed:
+            runtime.remember(app.stage, product_id=product.product_id, title=product.title, logo_url=job.logo_url)
 
     def _install_win32(self, job: Job, product: catalog.Product, runtime: runtimes.Runtime) -> None:
         """A classic installer from the publisher, run in the runtime's prefix with plain Wine."""

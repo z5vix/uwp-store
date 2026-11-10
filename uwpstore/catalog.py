@@ -334,6 +334,24 @@ def product(product_id: str) -> Product:
     )
 
 
+DISPLAY_CATALOG = "https://displaycatalog.mp.microsoft.com/v7.0"
+
+
+def gdk_content_id(product_id: str) -> str:
+    """A GDK title's content id (its MSIXVC package in the display catalogue), which Xbox Live's package service
+    and the licence take; "" for a product without one."""
+    cfg = settings.load()
+    query = urllib.parse.urlencode({"bigIds": product_id, "market": cfg["market"], "languages": cfg["locale"]})
+    data = net.get_json(f"{DISPLAY_CATALOG}/products?{query}", max_age=3600)
+    for raw in (data or {}).get("Products") or []:
+        for availability in raw.get("DisplaySkuAvailabilities") or []:
+            packages = ((availability.get("Sku") or {}).get("Properties") or {}).get("Packages") or []
+            for package in packages:
+                if (package.get("PackageFormat") or "").lower() == "msixvc" and package.get("ContentId"):
+                    return package["ContentId"]
+    return ""
+
+
 @dataclass
 class Win32Installer:
     """A classic (non-MSIX) Store listing: the publisher's own installer, which plain Wine/Proton runs."""

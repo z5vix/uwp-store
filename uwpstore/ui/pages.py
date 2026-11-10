@@ -10,6 +10,7 @@ from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 from .. import account, catalog, desktop, fe3, installer, packages, runtimes, xboxaccounts
 from . import widgets
+from .account import start_app
 from .util import clear, human_size, load_image, run_async, stars
 
 OpenProduct = Callable[[str, str], None]
@@ -183,6 +184,7 @@ class ProductPage(Gtk.Box):
         self.owned: bool | None = None          # None: not known (signed out, or still asking)
         self.owner: account.Profile | None = None   # the signed-in account that owns it
         self.offer_error = ""                   # why the delivery service has no installable package
+        self.gdk_content = ""                   # a GDK title's content id: installs straight from Xbox Live
         self.checking = False
         self.toast = toast
         self.open_settings = open_settings
@@ -324,12 +326,20 @@ class ProductPage(Gtk.Box):
         self.checking = True
         self._refresh()
 
-        def done(found: list[account.Profile]) -> None:
+        product = self.product
+
+        def work():
+            found = account.owners(product.product_id)
+            return found, (catalog.gdk_content_id(product.product_id) if product.is_msixvc else "")
+
+        def done(result) -> None:
+            found, self.gdk_content = result
             self.owner = found[0] if found else None
             self.owned = bool(found)
             self.checking = False
             owned = self.owned
-            if owned and self.product.category_id:
+            # a GDK title's FE3 category only carries a legacy UWP build (Minecraft: 1.21.114): no update offer
+            if owned and self.product.category_id and not self.gdk_content:
                 self._check_offer()
             else:
                 self._refresh()
@@ -338,7 +348,7 @@ class ProductPage(Gtk.Box):
             self.checking = False
             self.toast(f"Couldn't check your licence: {error}")
             self._refresh()
-        run_async(lambda: account.owners(self.product.product_id), done, failed)
+        run_async(work, done, failed)
 
     def _check_offer(self) -> None:
         """Ask the delivery service for the newest package, to offer an update over an older install."""
@@ -369,7 +379,7 @@ class ProductPage(Gtk.Box):
     @staticmethod
     def _package_kind(product: catalog.Product) -> str:
         if product.is_msixvc:
-            return "MSIXVC (Xbox PC game; installs through the Xbox app)"
+            return "MSIXVC (Xbox PC game; installs straight from Xbox Live with your licence)"
         if product.installer.lower() in ("windowsupdate", ""):
             return "MSIX/AppX through Store delivery"
         return f"Publisher installer ({product.installer}), run with Wine"
@@ -432,12 +442,21 @@ class ProductPage(Gtk.Box):
     def _installed(self) -> tuple[runtimes.Runtime, runtimes.InstalledApp] | None:
         if not self.product:
             return None
+        from .. import gdk
+        found = []
         for runtime in runtimes.discover():
             app = runtime.find_app(self.product.family_names[0] if self.product.family_names else "",
                                    self.product.product_id)
             if app:
-                return runtime, app
-        return None
+                found.append((runtime, app))
+                # a GDK title counts as installed only through its GDK install, not an old UWP one
+                if not self.product.is_msixvc or (runtime.stage_dir / app.stage / gdk.MARKER).is_file():
+                    return runtime, app
+            for other in runtime.apps() if self.product.is_msixvc else []:
+                marker = runtime.stage_dir / other.stage / gdk.MARKER
+                if marker.is_file() and self.product.product_id in marker.read_text():
+                    return runtime, other
+        return None if self.product.is_msixvc else (found[0] if found else None)
 
     def _xbox_app(self) -> tuple[runtimes.Runtime, runtimes.InstalledApp] | None:
         for runtime in runtimes.discover():
@@ -448,7 +467,8 @@ class ProductPage(Gtk.Box):
 
     def _via_xbox(self) -> bool:
         """Xbox PC (GDK/MSIXVC) games install through the Xbox app; the Store's own delivery has nothing for them."""
-        return self.product.is_msixvc and (self.offer is None) and (bool(self.offer_error) or not self.product.category_id)
+        return self.product.is_msixvc and not self.gdk_content and (self.offer is None) and \
+            (bool(self.offer_error) or not self.product.category_id)
 
     def _refresh(self) -> None:
         if not self.product:
@@ -525,8 +545,7 @@ class ProductPage(Gtk.Box):
         installed = self._installed()
         if installed:
             runtime, app = installed
-            runtime.run(app)
-            self.toast(f"Starting {app.title}")
+            start_app(self.get_root(), runtime, app, self.toast)
             return
         entitled = self.product.is_free or self.owned
         if not entitled:
@@ -670,9 +689,7 @@ class LibraryPage(Gtk.Box):
             run_async(lambda: runtime.stop(app), lambda _r: self.reload())
             button.set_sensitive(False)
             return
-        runtime.run(app)
-        self.toast(f"Starting {app.title}")
-        GLib.timeout_add_seconds(4, self.reload)
+        start_app(self.get_root(), runtime, app, self.toast, lambda: GLib.timeout_add_seconds(4, self.reload))
 
     def _open_log(self, runtime: runtimes.Runtime, app: runtimes.InstalledApp) -> None:
         for name in (f"{app.stage}.log", f"{app.stage}.store.log"):

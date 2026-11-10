@@ -168,6 +168,10 @@ class Runtime:
                 env.setdefault("WINE_UWP_FORCE_OVERRIDES", "1")
         if self.d3d_runtime:
             env["WINE_UWP_D3D_RUNTIME"] = str(self.d3d_runtime)
+        else:
+            from . import d3d                          # the store's shared copy, for GDK games
+            if d3d.available():
+                env["WINE_UWP_D3D_RUNTIME"] = str(d3d.root())
         if self.is_proton:
             for key, value in PROTON_GAME_ENV.items():
                 env.setdefault(key, value)

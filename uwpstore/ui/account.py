@@ -14,9 +14,15 @@ from .util import run_async
 class SignInDialog(Adw.Dialog):
     """Shows the one-time code and waits while the user approves it on microsoft.com/link in their browser."""
 
-    def __init__(self, on_done: Callable[[account.Profile], None]) -> None:
-        super().__init__(title="Sign in with Microsoft", content_width=440)
+    def __init__(self, on_done: Callable[[object], None], client_id: str = account.CLIENT_ID,
+                 heading: str = "Sign in with Microsoft", intro: str = "",
+                 finish: Callable[[dict], object] | None = None) -> None:
+        """The store's own sign-in by default. With client_id and finish: a sign-in for another Microsoft client (a
+        game's own), whose token response goes to finish (run off the main thread) instead of the account list."""
+        super().__init__(title=heading, content_width=440)
         self.on_done = on_done
+        self.client_id = client_id
+        self.finish = finish
         self._cancel = threading.Event()
         self.code: account.DeviceCode | None = None
 
@@ -25,8 +31,8 @@ class SignInDialog(Adw.Dialog):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_top=12, margin_bottom=24,
                       margin_start=24, margin_end=24)
         intro = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER,
-                          label="Your browser opens Microsoft's sign-in page with this code filled in. Sign in there "
-                                "and approve; your password never passes through this app.")
+                          label=intro or "Your browser opens Microsoft's sign-in page with this code filled in. Sign "
+                                         "in there and approve; your password never passes through this app.")
         box.append(intro)
         self.code_label = Gtk.Label(label="…", selectable=True)
         self.code_label.add_css_class("title-1")
@@ -53,7 +59,7 @@ class SignInDialog(Adw.Dialog):
         view.set_content(box)
         self.set_child(view)
         self.connect("closed", lambda *_: self._cancel.set())
-        run_async(account.start_device_code, self._got_code, self._failed)
+        run_async(lambda: account.start_device_code(client_id), self._got_code, self._failed)
 
     def _open(self) -> None:
         if self.code:
@@ -66,10 +72,14 @@ class SignInDialog(Adw.Dialog):
         self.copy_button.set_sensitive(True)
         self.status.set_label("Waiting for you to approve in the browser…")
         self._open()
-        run_async(lambda: account.poll_device_code(code, self._cancel.is_set), self._signed_in, self._failed)
+        if self.finish is None:
+            run_async(lambda: account.poll_device_code(code, self._cancel.is_set), self._signed_in, self._failed)
+        else:
+            run_async(lambda: self.finish(account.poll_client_code(code, self.client_id, self._cancel.is_set)),
+                      self._signed_in, self._failed)
 
-    def _signed_in(self, profile: account.Profile) -> None:
-        self.on_done(profile)
+    def _signed_in(self, result: object) -> None:
+        self.on_done(result)
         self.close()
 
     def _failed(self, error: Exception) -> None:
@@ -155,3 +165,38 @@ def status_text() -> str:
     current = account.active()
     others = len(found) - 1
     return f"Active: {current.name}" + (f", and {others} more signed in" if others else "")
+
+
+def start_app(parent: Gtk.Widget, runtime, app, toast: Callable[[str], None],
+              started: Callable[[], None] | None = None) -> None:
+    """Start an installed app. A GDK game that signs in as its own Microsoft client gets that one-time sign-in first."""
+    from .. import gdk
+
+    def run(_result: object = None) -> None:
+        runtime.run(app)
+        toast(f"Starting {app.title}")
+        if started:
+            started()
+
+    def checked(client: str) -> None:
+        if not client:
+            run()
+            return
+        who = gdk.signed_in_account(runtime)
+        intro = (f"{app.title} signs in to Xbox Live as its own Microsoft app, which needs your approval once. Your "
+                 f"browser opens Microsoft's page with this code filled in: approve it as "
+                 f"{who.name if who else 'the account that owns the game'}. Your password never passes through "
+                 "this app.")
+        SignInDialog(run, client_id=client, heading=f"Sign in for {app.title}", intro=intro,
+                     finish=lambda grant: gdk.import_title_signin(runtime, client, grant)).present(parent)
+
+    def prepare() -> str:
+        """Off the main thread: what an installed GDK game still needs before it starts."""
+        if gdk.redistributables_pending(runtime, app.stage):
+            gdk.install_redistributables(runtime, app.stage)
+        return gdk.title_signin_needed(runtime, app) if gdk.title_client(runtime, app) else ""
+
+    if not (runtime.stage_dir / app.stage / gdk.MARKER).is_file():
+        run()
+        return
+    run_async(prepare, checked, lambda _e: checked(""))
