@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.part
+# never commit Windows files, ISOs or harvested trees
+*.iso
+*.wim
+*.esd

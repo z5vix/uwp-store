@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=UWP Store
+Comment=Get Microsoft Store apps and games on Linux
+Exec=uwp-store
+Icon=io.github.uwpstore.Store
+Categories=System;PackageManager;
+Keywords=microsoft;store;uwp;msix;appx;xbox;
+StartupNotify=true
+Actions=Library;
+
+[Desktop Action Library]
+Name=Library
+Exec=uwp-store --page=library

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bag" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a90e2"/>
+      <stop offset="1" stop-color="#2a5fb0"/>
+    </linearGradient>
+    <linearGradient id="side" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6cc0"/>
+      <stop offset="1" stop-color="#1d4688"/>
+    </linearGradient>
+  </defs>
+  <!-- handle -->
+  <path d="M44 40 V32 a20 20 0 0 1 40 0 V40" fill="none" stroke="#1d4688" stroke-width="8" stroke-linecap="round"/>
+  <!-- bag body -->
+  <path d="M18 40 h92 l-6 70 a8 8 0 0 1 -8 7 H32 a8 8 0 0 1 -8 -7 z" fill="url(#bag)"/>
+  <path d="M18 40 h92 l-1 10 H19 z" fill="url(#side)"/>
+  <!-- a down arrow into a tray: "get" -->
+  <path d="M64 58 v26" stroke="#fff" stroke-width="9" stroke-linecap="round"/>
+  <path d="M51 74 l13 13 l13 -13" fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M42 98 h44" stroke="#fff" stroke-width="7" stroke-linecap="round" opacity="0.85"/>
+</svg>

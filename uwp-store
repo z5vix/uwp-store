@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launch UWP Store from its checkout, from anywhere.
+here=$(dirname "$(readlink -f "$0")")
+cd "$here" && exec python3 -m uwpstore "$@"
