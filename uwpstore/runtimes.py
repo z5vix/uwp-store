@@ -294,10 +294,40 @@ class Runtime:
     def stop(self, app: InstalledApp) -> None:
         if app.kind == "win32":
             subprocess.run([str(self.wineserver), "-k"], env=self.env(), timeout=30)
+        elif not self._run_locked(app) and self._stage_processes(app):
+            # started through a launcher that has exited (an EasyAntiCheat launcher): wine-uwp's own stop watcher went
+            # with it, so end the prefix (wineserver -k is scoped to WINEPREFIX)
+            subprocess.run([str(self.wineserver), "-k"], env=self.env(), timeout=30)
         else:
             subprocess.run(self.command("stop", app.stage), env=self.env(), timeout=60)
 
+    def _stage_processes(self, app: InstalledApp) -> list[int]:
+        """Processes in this prefix running an executable from the app's folder. A game started by a launcher outlives
+        the launcher, and with it wine-uwp's run lock."""
+        if app.kind != "uwp":
+            return []
+        stage = self.stage_dir / app.stage
+        roots = {str(stage), str(stage.resolve())}
+        wanted = {("z:" + r.replace("/", "\\")).lower() + "\\" for r in roots}
+        prefix = f"WINEPREFIX={self.prefix}".encode()
+        found = []
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if prefix not in (proc / "environ").read_bytes().split(b"\0"):
+                    continue
+                cmdline = (proc / "cmdline").read_bytes().split(b"\0")[0].decode(errors="replace").lower()
+            except OSError:
+                continue
+            if any(cmdline.startswith(w) for w in wanted):
+                found.append(int(proc.name))
+        return found
+
     def running(self, app: InstalledApp) -> bool:
+        return self._run_locked(app) or bool(self._stage_processes(app))
+
+    def _run_locked(self, app: InstalledApp) -> bool:
         lock = self.profile / "logs" / f".{app.stage}.running"
         if not lock.exists():
             return False
