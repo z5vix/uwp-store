@@ -19,6 +19,8 @@ Subject: [PATCH] UWP Store: Minecraft start-up fixes, GDK installs and title sig
     come from that client's title, which maps *.playfabapi.com to Minecraft's PlayFab relying party.
   * XboxAuthGetTokenAndSignature: success with an empty token for a URL with no relying party (it ran strlen on
     NULL and crashed the caller).
+  * take_msa_tokens: a refresh that names no user no longer blanks the stored user_id (the game's process never
+    read it, and XboxAuthHasClient then took the account's own client sign-in for another account's).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -457,7 +459,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      return S_OK;
 --- a/dlls/winexboxauth/auth.c
 +++ b/dlls/winexboxauth/auth.c
-@@ -981,6 +981,23 @@
+@@ -540,8 +540,10 @@
+     if (other)
+         store_update( "refresh_token", refresh_copy, "user_id", user_copy, "email", "", "store_account_id", "",
+                       "puid", "", NULL );
+-    else
++    else if (user_copy && *user_copy)
+         store_update( "refresh_token", refresh_copy, "user_id", user_copy, NULL );
++    else  /* a refresh that named no user, in a process that never read user_id: keep the stored one */
++        store_update( "refresh_token", refresh_copy, NULL );
+     str_wipe_free( refresh_copy );
+     free( user_copy );
+     TRACE( "Microsoft account tokens received (access %Iu chars, refresh %s, expires in %.0f s)\n", strlen( access ),
+@@ -981,6 +983,23 @@
      return S_OK;
  }
  
@@ -481,7 +495,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  static BOOL have_title_token( const char *want )
  {
      BOOL have;
-@@ -996,6 +1013,7 @@
+@@ -996,6 +1015,7 @@
  HRESULT ensure_title_identity( const char *msa_app, UINT32 title_id )
  {
      char want[32], *msa = NULL, *user_token = NULL, *xsts = NULL, *got;
@@ -489,7 +503,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      ULONGLONG user_expires, xsts_expires;
      struct json *answer = NULL;
      const char *uhs;
-@@ -1011,20 +1029,22 @@
+@@ -1011,20 +1031,22 @@
          LeaveCriticalSection( &account.signin_cs );
          return S_OK;
      }
@@ -516,7 +530,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      }
      str_wipe_free( msa );
      if (FAILED(hr))
-@@ -1034,6 +1054,13 @@
+@@ -1034,6 +1056,13 @@
      }
  
      EnterCriticalSection( &account.cs );
@@ -530,7 +544,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      if (strcmp( S(account.title_tid), want ))
      {
          got = str_dup( account.title_tid );
-@@ -1147,11 +1174,17 @@
+@@ -1147,11 +1176,17 @@
      if (!title_app || !*title_app || !title_id || !strcmp( title_app, MSA_CLIENT_ID )) return E_FAIL;
      snprintf( want, sizeof(want), "%u", title_id );
      SetEnvironmentVariableA( "WINE_UWP_XBOX_DEVICE_TYPE", "Win32" );
@@ -550,7 +564,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      ok = !strcmp( S(account.title_tid), want ) && account.title_token && *account.title_token;
      LeaveCriticalSection( &account.cs );
      if (!ok)
-@@ -1466,7 +1499,13 @@
+@@ -1466,7 +1501,13 @@
          if (status == 200 && *jget( j, "access_token" ))
          {
              char *key = refresh_store_key( client );
@@ -565,7 +579,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
              if (full_signin && !strcmp( key, "refresh_token" ))
              {
                  take_msa_tokens( j );
-@@ -1533,6 +1572,82 @@
+@@ -1533,6 +1574,85 @@
      TRACE( "signed out; the stored sign-in is deleted\n" );
  }
  
@@ -636,7 +650,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 +    user = store_get( "user_id" );
 +    if (!refresh || !*refresh) hr = S_FALSE;
 +    else if (!strcmp( key, "refresh_token" )) hr = S_OK;
-+    else hr = (owner && user && !strcmp( owner, user )) ? S_OK : S_FALSE;
++    else hr = (owner && user && !_stricmp( owner, user )) ? S_OK : S_FALSE;
++    TRACE( "client %s: refresh %s, owner %Iu chars, user %Iu chars, %s -> %#lx\n", client_id,
++           refresh && *refresh ? "yes" : "no", owner ? strlen( owner ) : 0, user ? strlen( user ) : 0,
++           owner && user && !_stricmp( owner, user ) ? "same account" : "other account", hr );
 +    str_wipe_free( refresh );
 +    free( owner );
 +    free( user );
@@ -648,7 +665,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  /* ---- relying parties: the title endpoints table ---- */
  
  struct endpoint
-@@ -1659,6 +1774,8 @@
+@@ -1659,6 +1779,8 @@
      EnterCriticalSection( &account.cs );
      skip = title_endpoints_loaded || !endpoints_loaded || !tid || !account.signed_in;
      if (!skip) title_endpoints_loaded = TRUE;  /* one attempt per process; get_token_for_url comes back here */
