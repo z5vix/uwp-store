@@ -1,0 +1,576 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: z5vix <z5vix@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:40:00 -0500
+Subject: [PATCH] UWP Store: older GDK packages (NTFS drive) and the 2019 GDK's XPackage
+
+Applies after 90-uwpstore-minecraft-gdk.patch. GE-Proton already has the EAC runtime support and __wine_unix_call. Found bringing up Gears 5 (2019 GDK, Microsoft Store build):
+- appxinstall: GDK packages built before SegmentMetadata.bin store the game as a disk image (GPT with 4096-byte
+  sectors, one NTFS volume). xvd_open now falls back to the volume's MFT when the user data has no segment table;
+  members become lists of page runs, decrypted per region (resident files are kept in memory). Attribute lists and
+  compressed, sparse or encrypted streams are refused rather than guessed at.
+- xgameruntime: the 2019 GDK asks for IXPackageImpl as {be3f3e9f-c4b3-424d-9a95-d1af060559a5}; refusing it made
+  Gears 5 exit silently right after XGameRuntimeInitialize. Unknown XPackage interfaces are now WARNed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/appxinstall/xvd.c
++++ b/dlls/appxinstall/xvd.c
+@@ -15,6 +15,10 @@
+  * half as the data key and its first as the tweak key, tweak = data unit (u32), region id (u32), first 8 bytes of
+  * the VDUID.
+  *
++ * Older packages (Gears 5) have no SegmentMetadata.bin: their drive is a disk image (GPT with 4096-byte sectors) with
++ * one NTFS volume, its MFT in the plain region 0x40000002 and each file's clusters inside one of the regions; those
++ * are read through the MFT instead.
++ *
+  * Copyright 2026 wine-uwp contributors
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -44,11 +48,21 @@
+ #define PAGES_PER_READ 2048     /* 8 MiB: the HTTP source reads that much straight through, without its cache */
+ #define L0_WINDOW (8u << 20)
+ 
++#define SPARSE (~(UINT64)0)
++
++struct xvd_run
++{
++    UINT64 page, count;     /* file pages; page SPARSE for a hole */
++};
++
+ struct xvd_member
+ {
+     WCHAR *name;            /* '/'-separated */
+-    UINT64 size, page;
++    UINT64 size;
+     UINT32 region;
++    struct xvd_run *runs;
++    unsigned int run_count;
++    BYTE *resident;         /* an NTFS file small enough to live in its MFT record */
+ };
+ 
+ struct xvd
+@@ -57,7 +71,7 @@
+     BYTE vduid[8];
+     BYTE content_id[16];
+     BYTE key_ids[KEY_SLOTS][16];
+-    UINT64 l0, l0_pages, user;
++    UINT64 l0, l0_pages, user, drive, drive_pages;
+     struct xvd_region *regions;
+     unsigned int region_count;
+     struct xvd_member *members;
+@@ -209,6 +223,9 @@
+     return hr;
+ }
+ 
++static HRESULT ntfs_members( struct xvd *xvd, const struct appx_install_params *params );
++static HRESULT add_member( struct xvd *xvd, const WCHAR *name, UINT64 size, UINT32 region, struct xvd_member **out );
++
+ /* S_FALSE if source is not an XVD */
+ HRESULT xvd_open( struct source *source, const struct appx_install_params *params, struct xvd **out )
+ {
+@@ -244,6 +261,8 @@
+     xvd->user = xvd->l0 + levels[0];
+     xvc_at = xvd->user + pages( user );
+     xvc_len = pages( xvc ) * PAGE;
++    xvd->drive = xvc_at + pages( xvc ) + pages( dyn );
++    xvd->drive_pages = pages( drive );
+ 
+     hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
+     if (xvc_len < 0xDA8) goto fail;
+@@ -271,7 +290,10 @@
+         region->first_segment = le32( r + 12 );
+         region->first_page = le64( r + 0x50 ) / PAGE;
+         region->pages = le64( r + 0x58 ) / PAGE;
++        TRACE( "region %#x key %#x first segment %u, pages %I64u..+%I64u\n", region->id, region->key,
++               region->first_segment, region->first_page, region->pages );
+     }
++    TRACE( "XVC info version %u, %u regions, %u update segments, %u specifiers\n", version, count, updates, nspecs );
+     /* region specifiers, after 12 bytes per update segment: "Tags" (the install features a region belongs to,
+      * "a#b" when it needs both) and "Languages" */
+     for (i = 0; i < nspecs; i++)
+@@ -312,6 +334,7 @@
+         WCHAR *name = utf16_field( e, 520 );
+         UINT32 size = le32( e + 520 ), off = le32( e + 524 );
+ 
++        TRACE( "user data file %s, %u bytes\n", debugstr_w(name), size );
+         if (name && !wcsicmp( name, L"SegmentMetadata.bin" ) && 16ull + off + size <= user)
+         {
+             seg = ud + 16 + off;
+@@ -319,11 +342,13 @@
+         }
+         free( name );
+     }
+-    if (!seg || seg_size < 20 || memcmp( seg, " PFX", 4 ))
++    if (!seg)
+     {
+-        ERR( "this GDK package has no segment table; only packages with one are supported\n" );
++        /* older packages (2019 and before): the drive is a disk image with one NTFS partition */
++        hr = ntfs_members( xvd, params );
+         goto fail;
+     }
++    if (seg_size < 20 || memcmp( seg, " PFX", 4 )) goto fail;
+     hlen = le32( seg + 12 );
+     segs = le32( seg + 16 );
+     if (hlen + 16ull * segs > seg_size) goto fail;
+@@ -353,27 +378,14 @@
+         if (!region_wanted( r, params )) continue;
+         for (k = r->first_segment; k < segs && page < r->first_page + r->pages; k++)
+         {
+-            struct xvd_member *m, *members;
++            struct xvd_member *m;
+ 
+-            if (unsafe_segment( entries[k].name ))
+-            {
+-                ERR( "refusing unsafe path in package: %s\n", debugstr_w(entries[k].name) );
+-                hr = HRESULT_FROM_WIN32( ERROR_BAD_PATHNAME );
+-                goto fail;
+-            }
+-            if (!(members = realloc( xvd->members, (xvd->member_count + 1) * sizeof(*members) )))
+-            {
+-                hr = E_OUTOFMEMORY;
+-                goto fail;
+-            }
+-            xvd->members = members;
+-            m = &members[xvd->member_count];
+-            if (!(m->name = strdupW( entries[k].name ))) { hr = E_OUTOFMEMORY; goto fail; }
+-            xvd->member_count++;
+-            m->size = entries[k].size;
+-            m->region = r->id;
+-            m->page = page;
+-            page += max( 1, pages( m->size ) );
++            if (FAILED(hr = add_member( xvd, entries[k].name, entries[k].size, r->id, &m ))) goto fail;
++            if (!(m->runs = malloc( sizeof(*m->runs) ))) { hr = E_OUTOFMEMORY; goto fail; }
++            m->runs[0].page = page;
++            m->runs[0].count = max( 1, pages( m->size ) );
++            m->run_count = 1;
++            page += m->runs[0].count;
+         }
+     }
+     hr = S_OK;
+@@ -401,13 +413,6 @@
+ unsigned int xvd_region_count( const struct xvd *xvd ) { return xvd->region_count; }
+ const struct xvd_region *xvd_region( const struct xvd *xvd, unsigned int index ) { return &xvd->regions[index]; }
+ 
+-static const struct xvd_region *find_region( const struct xvd *xvd, UINT32 id )
+-{
+-    unsigned int i;
+-    for (i = 0; i < xvd->region_count; i++) if (xvd->regions[i].id == id) return &xvd->regions[i];
+-    return NULL;
+-}
+-
+ static HRESULT get_cipher( struct xvd *xvd, UINT16 slot, struct xts **xts )
+ {
+     BYTE key[32], swapped[32];
+@@ -483,27 +488,363 @@
+     return S_OK;
+ }
+ 
++static HRESULT add_member( struct xvd *xvd, const WCHAR *name, UINT64 size, UINT32 region, struct xvd_member **out )
++{
++    struct xvd_member *members, *m;
++
++    if (unsafe_segment( name ))
++    {
++        ERR( "refusing unsafe path in package: %s\n", debugstr_w(name) );
++        return HRESULT_FROM_WIN32( ERROR_BAD_PATHNAME );
++    }
++    if (!(members = realloc( xvd->members, (xvd->member_count + 1) * sizeof(*members) ))) return E_OUTOFMEMORY;
++    xvd->members = members;
++    m = &members[xvd->member_count];
++    memset( m, 0, sizeof(*m) );
++    if (!(m->name = strdupW( name ))) return E_OUTOFMEMORY;
++    xvd->member_count++;
++    m->size = size;
++    m->region = region;
++    *out = m;
++    return S_OK;
++}
++
++static const struct xvd_region *region_at( const struct xvd *xvd, UINT64 page )
++{
++    unsigned int i;
++    for (i = 0; i < xvd->region_count; i++)
++        if (page >= xvd->regions[i].first_page && page - xvd->regions[i].first_page < xvd->regions[i].pages)
++            return &xvd->regions[i];
++    return NULL;
++}
++
++/* file pages, each decrypted as the region it is in needs (a page in no region is plain) */
++static HRESULT read_any( struct xvd *xvd, UINT64 page, ULONG count, BYTE *out )
++{
++    static const struct xvd_region plain = { 0, 0, 0xffff };
++    HRESULT hr;
++
++    while (count)
++    {
++        const struct xvd_region *r = region_at( xvd, page );
++        ULONG n = count;
++
++        if (r) n = (ULONG)min( (UINT64)n, r->first_page + r->pages - page );
++        else
++        {
++            unsigned int i;
++            for (i = 0; i < xvd->region_count; i++)
++                if (xvd->regions[i].first_page > page)
++                    n = (ULONG)min( (UINT64)n, xvd->regions[i].first_page - page );
++        }
++        if (FAILED(hr = read_pages( xvd, r ? r : &plain, page, n, out ))) return hr;
++        page += n;
++        count -= n;
++        out += (size_t)n * PAGE;
++    }
++    return S_OK;
++}
++
++/*
++ * Older packages: the drive is a disk image (GPT, MBR or none) holding one NTFS volume. Its MFT is read through the
++ * same page decryption, every regular file outside the volume's own $ files becomes a member, and a member's runs are
++ * its clusters' pages. Files the package builder writes are not compressed and have no attribute list.
++ */
++struct ntfs_file
++{
++    WCHAR *name;
++    UINT64 parent, size;
++    BOOL in_use, dir;
++    struct xvd_run *runs;
++    unsigned int run_count;
++    BYTE *resident;
++};
++
++static HRESULT ntfs_runs( struct xvd *xvd, const BYTE *a, ULONG alen, UINT64 base, UINT64 cpp, struct ntfs_file *f )
++{
++    ULONG off = le16( a + 0x20 );
++    INT64 lcn = 0;
++
++    while (off < alen && a[off])
++    {
++        unsigned int ln = a[off] & 15, lo = a[off] >> 4, j;
++        UINT64 length = 0;
++        INT64 delta = 0;
++        struct xvd_run *runs;
++
++        if (!ln || ln > 8 || lo > 8 || off + 1 + ln + lo > alen) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++        for (j = 0; j < ln; j++) length |= (UINT64)a[off + 1 + j] << (8 * j);
++        for (j = 0; j < lo; j++) delta |= (INT64)a[off + 1 + ln + j] << (8 * j);
++        if (lo && lo < 8 && (a[off + ln + lo] & 0x80)) delta |= -((INT64)1 << (8 * lo));      /* sign-extend */
++        if (!(runs = realloc( f->runs, (f->run_count + 1) * sizeof(*runs) ))) return E_OUTOFMEMORY;
++        f->runs = runs;
++        runs[f->run_count].count = length * cpp;
++        if (lo)
++        {
++            lcn += delta;
++            if (lcn < 0 || base + (UINT64)lcn * cpp + length * cpp > xvd->drive_pages)
++                return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++            runs[f->run_count].page = xvd->drive + base + lcn * cpp;
++        }
++        else runs[f->run_count].page = SPARSE;
++        f->run_count++;
++        off += 1 + ln + lo;
++    }
++    return S_OK;
++}
++
++/* one MFT record: undo its fixups and read its name, parent, size and data */
++static HRESULT ntfs_record( struct xvd *xvd, BYTE *r, ULONG size, UINT64 base, UINT64 cpp, struct ntfs_file *f )
++{
++    UINT16 uo = le16( r + 4 ), un = le16( r + 6 ), flags;
++    ULONG stride, off, i;
++    int name_ns = -1;
++    HRESULT hr;
++
++    if (memcmp( r, "FILE", 4 )) return S_OK;
++    if (un < 2 || uo + 2u * un > size || size % (un - 1)) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++    stride = size / (un - 1);
++    for (i = 1; i < un; i++)
++    {
++        BYTE *end = r + i * stride - 2;
++        if (memcmp( end, r + uo, 2 )) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++        memcpy( end, r + uo + 2 * i, 2 );
++    }
++    flags = le16( r + 0x16 );
++    if (!(flags & 1) || (le64( r + 0x20 ) & 0xffffffffffffull)) return S_OK;      /* free, or an extension record */
++    f->in_use = TRUE;
++    f->dir = !!(flags & 2);
++    for (off = le16( r + 0x14 ); off + 16 <= size && le32( r + off ) != 0xffffffff; )
++    {
++        UINT32 type = le32( r + off ), alen = le32( r + off + 4 );
++        const BYTE *a = r + off;
++
++        if (alen < 16 || off + alen > size) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++        if (type == 0x20)
++        {
++            ERR( "an NTFS file in this package has an attribute list; that is not supported\n" );
++            return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
++        }
++        if (type == 0x30 && !a[8])
++        {
++            ULONG vo = le16( a + 0x14 ), vl = le32( a + 0x10 );
++            const BYTE *v = a + vo;
++            if (vo + vl > alen || vl < 0x42 || 0x42 + 2u * v[0x40] > vl) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++            if (v[0x41] != 2 || name_ns < 0)            /* the long name, not the 8.3 one */
++            {
++                free( f->name );
++                if (!(f->name = malloc( (v[0x40] + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++                memcpy( f->name, v + 0x42, v[0x40] * sizeof(WCHAR) );
++                f->name[v[0x40]] = 0;
++                f->parent = le64( v ) & 0xffffffffffffull;
++                name_ns = v[0x41];
++            }
++        }
++        if (type == 0x80 && !a[9])                      /* the unnamed data stream */
++        {
++            if (le16( a + 0x0c ))
++            {
++                ERR( "an NTFS file in this package is compressed, sparse or encrypted; that is not supported\n" );
++                return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
++            }
++            if (a[8])
++            {
++                if (alen < 0x40 || le64( a + 0x10 )) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++                f->size = le64( a + 0x30 );
++                if (FAILED(hr = ntfs_runs( xvd, a, alen, base, cpp, f ))) return hr;
++            }
++            else
++            {
++                ULONG vo = le16( a + 0x14 ), vl = le32( a + 0x10 );
++                if (vo + vl > alen) return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++                f->size = vl;
++                if (!(f->resident = malloc( vl ? vl : 1 ))) return E_OUTOFMEMORY;
++                memcpy( f->resident, a + vo, vl );
++            }
++        }
++        off += alen;
++    }
++    return S_OK;
++}
++
++/* where the NTFS volume starts, in drive pages */
++static HRESULT ntfs_volume( struct xvd *xvd, UINT64 *base, BYTE *boot )
++{
++    BYTE *buf;
++    HRESULT hr;
++    UINT64 lba = 0;
++
++    if (!(buf = malloc( 2 * PAGE ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = read_any( xvd, xvd->drive, 2, buf ))) goto done;
++    *base = 0;
++    if (!memcmp( buf + 3, "NTFS    ", 8 )) goto found;
++    if (!memcmp( buf + PAGE, "EFI PART", 8 ))           /* 4096-byte sectors: the GPT header is the second page */
++    {
++        UINT64 entries = le64( buf + PAGE + 72 );
++        UINT32 n = le32( buf + PAGE + 80 ), size = le32( buf + PAGE + 84 ), i;
++        hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++        if (size < 128 || size > PAGE || entries >= xvd->drive_pages) goto done;
++        if (FAILED(hr = read_any( xvd, xvd->drive + entries, 1, buf ))) goto done;
++        for (i = 0; i < n && (i + 1) * size <= PAGE; i++)
++        {
++            const BYTE *e = buf + i * size;
++            static const BYTE zero[16];
++            if (memcmp( e, zero, 16 )) { lba = le64( e + 32 ); break; }
++        }
++    }
++    else if (buf[0x1fe] == 0x55 && buf[0x1ff] == 0xaa && buf[0x1c2] && buf[0x1c2] != 0xee)
++        lba = le32( buf + 0x1c6 ) * 512ull / PAGE;
++    hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++    if (!lba || lba >= xvd->drive_pages) goto done;
++    *base = lba;
++    if (FAILED(hr = read_any( xvd, xvd->drive + lba, 1, buf ))) goto done;
++    hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++    if (memcmp( buf + 3, "NTFS    ", 8 )) goto done;
++found:
++    memcpy( boot, buf, 512 );
++    hr = S_OK;
++done:
++    free( buf );
++    return hr;
++}
++
++static HRESULT ntfs_members( struct xvd *xvd, const struct appx_install_params *params )
++{
++    struct ntfs_file *files = NULL, mft = { 0 };
++    UINT64 base, cluster, cpp, record_size, count = 0, i, at = 0;
++    BYTE boot[512], *buf = NULL;
++    unsigned int k;
++    signed char rs;
++    HRESULT hr;
++
++    if (FAILED(hr = ntfs_volume( xvd, &base, boot )))
++    {
++        ERR( "this GDK package has no segment table and no NTFS volume; it is not supported\n" );
++        return hr;
++    }
++    hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++    cluster = (UINT64)le16( boot + 0x0b ) * boot[0x0d];
++    rs = (signed char)boot[0x40];
++    record_size = rs < 0 ? 1ull << -rs : rs * cluster;
++    if (!cluster || cluster % PAGE || record_size < 512 || PAGE % record_size)
++    {
++        ERR( "NTFS clusters of %I64u bytes and records of %I64u are not supported\n", cluster, record_size );
++        return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
++    }
++    cpp = cluster / PAGE;
++    TRACE( "NTFS volume at drive page %I64u, %I64u-byte clusters, MFT at %I64u\n", base, cluster, le64( boot + 0x30 ) );
++
++    /* record 0 is the MFT itself */
++    if (!(buf = malloc( PAGES_PER_READ * PAGE ))) return E_OUTOFMEMORY;
++    if (le64( boot + 0x30 ) * cpp + base >= xvd->drive_pages) goto done;
++    if (FAILED(hr = read_any( xvd, xvd->drive + base + le64( boot + 0x30 ) * cpp, 1, buf ))) goto done;
++    if (FAILED(hr = ntfs_record( xvd, buf, record_size, base, cpp, &mft ))) goto done;
++    hr = HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
++    if (!mft.run_count || mft.size > (1ull << 32)) goto done;
++    count = mft.size / record_size;
++    if (!(files = calloc( count ? count : 1, sizeof(*files) ))) { hr = E_OUTOFMEMORY; goto done; }
++    for (k = 0; k < mft.run_count && at < count; k++)
++    {
++        UINT64 page = mft.runs[k].page, left = mft.runs[k].count;
++        while (left && at < count)
++        {
++            ULONG n = (ULONG)min( left, PAGES_PER_READ ), j;
++            if (page == SPARSE) goto done;
++            if (FAILED(hr = read_any( xvd, page, n, buf ))) goto done;
++            for (j = 0; j < n * (PAGE / record_size) && at < count; j++, at++)
++                if (FAILED(hr = ntfs_record( xvd, buf + j * record_size, record_size, base, cpp, &files[at] )))
++                    goto done;
++            page += n;
++            left -= n;
++        }
++    }
++
++    /* the files, with their paths from the root (record 5) */
++    for (i = 16; i < count; i++)
++    {
++        struct ntfs_file *f = &files[i];
++        UINT64 chain[64], p = i;
++        unsigned int depth = 0, len = 0, d;
++        const struct xvd_region *r = NULL;
++        struct xvd_member *m;
++        WCHAR *path;
++
++        if (!f->in_use || f->dir || !f->name) continue;
++        while (p != 5 && depth < ARRAY_SIZE(chain) && p < count && files[p].in_use && files[p].name)
++        {
++            chain[depth++] = p;
++            len += wcslen( files[p].name ) + 1;
++            p = files[p].parent;
++        }
++        if (p != 5) continue;                           /* orphaned, or a loop */
++        if (files[chain[depth - 1]].name[0] == '$') continue;     /* the volume's own files ($Extend) */
++        if (!(path = malloc( len * sizeof(WCHAR) ))) { hr = E_OUTOFMEMORY; goto done; }
++        path[0] = 0;
++        for (d = depth; d--; )
++        {
++            wcscat( path, files[chain[d]].name );
++            if (d) wcscat( path, L"/" );
++        }
++        for (k = 0; k < f->run_count && !r; k++) if (f->runs[k].page != SPARSE) r = region_at( xvd, f->runs[k].page );
++        if (r && !region_wanted( r, params ))
++        {
++            free( path );
++            continue;
++        }
++        hr = add_member( xvd, path, f->size, r ? r->id : 0x40000002, &m );
++        free( path );
++        if (FAILED(hr)) goto done;
++        m->runs = f->runs;
++        m->run_count = f->run_count;
++        m->resident = f->resident;
++        f->runs = NULL;
++        f->resident = NULL;
++    }
++    hr = S_OK;
++
++done:
++    for (i = 0; i < count; i++)
++    {
++        free( files[i].name );
++        free( files[i].runs );
++        free( files[i].resident );
++    }
++    free( files );
++    free( mft.name );
++    free( mft.runs );
++    free( mft.resident );
++    free( buf );
++    return hr;
++}
++
+ HRESULT xvd_extract( struct xvd *xvd, unsigned int index,
+                      BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context )
+ {
+     const struct xvd_member *m = &xvd->members[index];
+-    const struct xvd_region *region = find_region( xvd, m->region );
+-    UINT64 page = m->page, left = m->size, pages_left = max( 1, pages( m->size ) );
++    UINT64 left = m->size;
++    unsigned int k;
+     BYTE *buf;
+     HRESULT hr = S_OK;
+ 
+-    if (!region) return E_UNEXPECTED;
++    if (m->resident) return write( context, m->resident, (ULONG)m->size ) ? S_OK : HRESULT_FROM_WIN32( ERROR_CANCELLED );
+     if (!(buf = malloc( PAGES_PER_READ * PAGE ))) return E_OUTOFMEMORY;
+-    while (left)
++    for (k = 0; left && SUCCEEDED(hr); k++)
+     {
+-        ULONG n = min( PAGES_PER_READ, pages_left ), bytes;
++        UINT64 page = k < m->run_count ? m->runs[k].page : SPARSE;
++        UINT64 run = k < m->run_count ? m->runs[k].count : pages( left );     /* past the runs: zeros */
+ 
+-        if (FAILED(hr = read_pages( xvd, region, page, n, buf ))) break;
+-        page += n;
+-        pages_left -= n;
+-        bytes = (ULONG)min( left, (UINT64)n * PAGE );
+-        left -= bytes;
+-        if (!write( context, buf, bytes )) { hr = HRESULT_FROM_WIN32( ERROR_CANCELLED ); break; }
++        while (run && left)
++        {
++            ULONG n = (ULONG)min( PAGES_PER_READ, run ), bytes;
++
++            if (page == SPARSE) memset( buf, 0, (size_t)n * PAGE );
++            else if (FAILED(hr = read_any( xvd, page, n, buf ))) break;
++            if (page != SPARSE) page += n;
++            run -= n;
++            bytes = (ULONG)min( left, (UINT64)n * PAGE );
++            left -= bytes;
++            if (!write( context, buf, bytes )) { hr = HRESULT_FROM_WIN32( ERROR_CANCELLED ); break; }
++        }
+     }
+     free( buf );
+     return hr;
+@@ -515,7 +856,12 @@
+ 
+     if (!xvd) return;
+     for (i = 0; i < KEY_SLOTS; i++) xts_destroy( xvd->ciphers[i] );
+-    for (i = 0; i < xvd->member_count; i++) free( xvd->members[i].name );
++    for (i = 0; i < xvd->member_count; i++)
++    {
++        free( xvd->members[i].name );
++        free( xvd->members[i].runs );
++        free( xvd->members[i].resident );
++    }
+     for (i = 0; i < xvd->region_count; i++)
+     {
+         free_list( xvd->regions[i].tags, xvd->regions[i].tag_count );
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -631,6 +631,8 @@
+ static const GUID IID_IXPackageImpl2 = {0xf92d8712,0x2b27,0x4d8a,{0xbf,0x01,0x11,0xa6,0xf8,0xe3,0xeb,0x42}};
+ static const GUID IID_IXPackageImpl3 = {0xe2a4734b,0x2f4a,0x456d,{0xaa,0x8f,0xd0,0x65,0xe0,0x4f,0xb2,0x09}};
+ static const GUID IID_IXPackageImpl4 = {0x0b9d556e,0xab70,0x43f4,{0xba,0xa0,0x99,0x99,0xac,0x4c,0xb0,0x40}};
++/* the 2019 GDK's IXPackageImpl (Gears 5): the same first methods as IXPackageImpl */
++static const GUID IID_IXPackageImpl_2019 = {0xbe3f3e9f,0xc4b3,0x424d,{0x9a,0x95,0xd1,0xaf,0x06,0x05,0x59,0xa5}};
+ 
+ static HRESULT WINAPI pkg_QueryInterface( gdk_object *iface, REFIID iid, void **out )
+ {
+@@ -638,8 +640,11 @@
+     *out = NULL;
+     if (!IsEqualGUID( iid, &IID_IUnknown ) && !IsEqualGUID( iid, &IID_IXPackageImpl ) &&
+         !IsEqualGUID( iid, &IID_IXPackageImpl2 ) && !IsEqualGUID( iid, &IID_IXPackageImpl3 ) &&
+-        !IsEqualGUID( iid, &IID_IXPackageImpl4 ))
++        !IsEqualGUID( iid, &IID_IXPackageImpl4 ) && !IsEqualGUID( iid, &IID_IXPackageImpl_2019 ))
++    {
++        WARN( "unknown interface %s\n", debugstr_guid(iid) );
+         return E_NOINTERFACE;
++    }
+     *out = iface;
+     return S_OK;
+ }

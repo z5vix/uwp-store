@@ -172,6 +172,9 @@ class Runtime:
             from . import d3d                          # the store's shared copy, for GDK games
             if d3d.available():
                 env["WINE_UWP_D3D_RUNTIME"] = str(d3d.root())
+        from . import anticheat
+        for key, value in anticheat.env().items():
+            env.setdefault(key, value)
         if self.is_proton:
             for key, value in PROTON_GAME_ENV.items():
                 env.setdefault(key, value)
