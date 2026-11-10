@@ -1,0 +1,1120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: z5vix <z5vix@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:55:00 -0500
+Subject: [PATCH] UWP Store: Xbox app: IPackageManager3, both Gaming Services identity layouts, stand-in package updates
+
+Applies after 91-uwpstore-gdk-ntfs-packages.patch. Found bringing up the current Xbox app (XboxPcApp / XboxPcAppFT):
+- appxdeploymentclient: IPackageManager3 (the volume methods; the volume is package_volume_create's system
+  volume). The app's full-trust helper used the NULL that E_NOINTERFACE left it and crashed at start.
+- winexboxauth: IUser and IXboxAuthManager keep their name-derived IIDs while Gaming Services inserts methods
+  (User.LocalId, NonRoamableId, GetMsaTicketWithUiAsync; XboxAuthManager.RestartApps), so the vtable an app calls
+  depends on the Microsoft.GamePlatform.Services.winmd its projection was built from. The previous table matched
+  neither the Microsoft Store's winmd nor the Xbox app's: the Xbox app read User.AgeGroup (3) as XuidStr's HSTRING
+  and faulted on address 0x13 in two processes. Both layouts are kept now, chosen by whether the package's own
+  winmd declares get_LocalId / RestartApps; the statics gain SetSandbox, IsValidSandboxName, SignOutAllUsersAsync.
+- appxdeploymentclient: AddPackageAsync / AddPackageToVolumeAsync for stand-in packages. The Xbox app updates
+  Gaming Services from the gamingservices-signed.appxbundle it carries when the installed version is older (it
+  ships 39.118; the stand-in said 37.114) and showed "Try the update again" (0x80004001). The package's identity
+  is read from its manifest (zip / zip64); when it is a stand-in, the stand-in is raised to that version and the
+  deployment completes. Other packages are still not deployed from here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/appxdeploymentclient/Makefile.in
++++ b/dlls/appxdeploymentclient/Makefile.in
+@@ -1,10 +1,12 @@
+ MODULE  = appxdeploymentclient.dll
+-IMPORTS = combase advapi32
++IMPORTS = combase advapi32 shlwapi $(ZLIB_PE_LIBS)
++EXTRAINCL = $(ZLIB_PE_CFLAGS)
+ 
+ SOURCES = \
+ 	async.c \
+ 	async_private.idl \
+ 	classes.idl \
++	deploy.c \
+ 	main.c \
+ 	package.c \
+ 	packagelist.c \
+--- a/dlls/appxdeploymentclient/private.h
++++ b/dlls/appxdeploymentclient/private.h
+@@ -53,6 +53,7 @@
+ HRESULT package_volume_create( IPackageVolume **out );
+ HRESULT standin_package_create( const WCHAR *family, IPackage **out );
+ HRESULT package_list_create( IPackage *package, IIterable_Package **out );
++HRESULT deploy_package( IUriRuntimeClass *uri, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **out );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+--- a/dlls/appxdeploymentclient/package.c
++++ b/dlls/appxdeploymentclient/package.c
+@@ -31,6 +31,7 @@
+     IPackageManager IPackageManager_iface;
+     IPackageManager2 IPackageManager2_iface;
+     IPackageManager4 IPackageManager4_iface;
++    IInspectable IPackageManager3_iface;    /* IPackageManager3: not in Wine's IDL, so a vtable of its own */
+     LONG ref;
+ };
+ 
+@@ -39,6 +40,8 @@
+     return CONTAINING_RECORD( iface, struct package_manager, IPackageManager_iface );
+ }
+ 
++static const GUID IID_IPackageManager3_ = {0xdaad9948,0x36f1,0x41a7,{0x91,0x88,0xbc,0x26,0x3e,0x0d,0xcb,0x72}};
++
+ static HRESULT WINAPI package_manager_QueryInterface( IPackageManager *iface, REFIID iid, void **out )
+ {
+     struct package_manager *impl = impl_from_IPackageManager( iface );
+@@ -69,6 +72,13 @@
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IPackageManager3_ ))
++    {
++        *out = &impl->IPackageManager3_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -114,8 +124,10 @@
+ static HRESULT WINAPI package_manager_AddPackageAsync( IPackageManager *iface, IUriRuntimeClass *uri,
+     IIterable_Uri *dependencies, DeploymentOptions options, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **operation )
+ {
+-    FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
+-    return E_NOTIMPL;
++    HRESULT hr = deploy_package( uri, operation );
++    if (hr == E_NOTIMPL)
++        FIXME( "iface %p, uri %p, dependencies %p, options %d, operation %p stub!\n", iface, uri, dependencies, options, operation );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI package_manager_UpdatePackageAsync( IPackageManager *iface, IUriRuntimeClass *uri, IIterable_Uri *dependencies,
+@@ -504,6 +516,146 @@
+                                                NULL, get_package_volumes, (IAsyncOperation_IInspectable **)operation );
+ }
+ 
++/*
++ * IPackageManager3 (the volume methods). The Xbox app's full-trust helper asks for it while it looks for where games
++ * go, and used the NULL that E_NOINTERFACE left it. The volumes are package_volume_create's system volume.
++ */
++static struct package_manager *impl_from_IPackageManager3( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct package_manager, IPackageManager3_iface );
++}
++
++static HRESULT WINAPI package_manager3_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    return package_manager_QueryInterface( &impl_from_IPackageManager3( iface )->IPackageManager_iface, iid, out );
++}
++static ULONG WINAPI package_manager3_AddRef( IInspectable *iface )
++{
++    return IPackageManager_AddRef( &impl_from_IPackageManager3( iface )->IPackageManager_iface );
++}
++static ULONG WINAPI package_manager3_Release( IInspectable *iface )
++{
++    return IPackageManager_Release( &impl_from_IPackageManager3( iface )->IPackageManager_iface );
++}
++static HRESULT WINAPI package_manager3_GetIids( IInspectable *iface, ULONG *count, IID **iids )
++{
++    return IPackageManager_GetIids( &impl_from_IPackageManager3( iface )->IPackageManager_iface, count, iids );
++}
++static HRESULT WINAPI package_manager3_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    return IPackageManager_GetRuntimeClassName( &impl_from_IPackageManager3( iface )->IPackageManager_iface, name );
++}
++static HRESULT WINAPI package_manager3_GetTrustLevel( IInspectable *iface, TrustLevel *level )
++{
++    return IPackageManager_GetTrustLevel( &impl_from_IPackageManager3( iface )->IPackageManager_iface, level );
++}
++
++#define PM3_NOTIMPL( name, ... ) \
++    static HRESULT WINAPI package_manager3_##name( IInspectable *iface, __VA_ARGS__ ) \
++    { \
++        FIXME( "iface %p: " #name " not implemented.\n", iface ); \
++        return E_NOTIMPL; \
++    }
++PM3_NOTIMPL( AddPackageVolumeAsync, HSTRING path, void **operation )
++static HRESULT WINAPI package_manager3_AddPackageToVolumeAsync( IInspectable *iface, IUriRuntimeClass *uri, void *deps,
++                                                                 DeploymentOptions options, IPackageVolume *volume,
++                                                                 void **operation )
++{
++    HSTRING s = NULL;
++    HRESULT hr = deploy_package( uri, (IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **)operation );
++
++    if (hr == E_NOTIMPL)
++    {
++        if (uri) IUriRuntimeClass_get_AbsoluteUri( uri, &s );
++        FIXME( "iface %p, uri %s, deps %p, options %#x, volume %p: not implemented.\n", iface, debugstr_hstring( s ),
++               deps, options, volume );
++        WindowsDeleteString( s );
++    }
++    return hr;
++}
++PM3_NOTIMPL( RegisterPackageWithAppDataVolumeAsync, IUriRuntimeClass *uri, void *deps, DeploymentOptions options,
++             IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( MovePackageToVolumeAsync, HSTRING name, DeploymentOptions options, IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( RemovePackageVolumeAsync, IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( SetPackageVolumeOfflineAsync, IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( SetPackageVolumeOnlineAsync, IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( StagePackageToVolumeAsync, IUriRuntimeClass *uri, void *deps, DeploymentOptions options,
++             IPackageVolume *volume, void **operation )
++PM3_NOTIMPL( StageUserDataWithOptionsAsync, HSTRING name, DeploymentOptions options, void **operation )
++#undef PM3_NOTIMPL
++
++static HRESULT WINAPI package_manager3_ClearPackageStatus( IInspectable *iface, HSTRING name, UINT32 status )
++{
++    FIXME( "iface %p, name %s, status %#x: nothing kept.\n", iface, debugstr_hstring( name ), status );
++    return S_OK;
++}
++
++static HRESULT WINAPI package_manager3_SetPackageStatus( IInspectable *iface, HSTRING name, UINT32 status )
++{
++    FIXME( "iface %p, name %s, status %#x: nothing kept.\n", iface, debugstr_hstring( name ), status );
++    return S_OK;
++}
++
++static HRESULT WINAPI package_manager3_GetDefaultPackageVolume( IInspectable *iface, IPackageVolume **volume )
++{
++    TRACE( "iface %p, volume %p.\n", iface, volume );
++    if (!volume) return E_POINTER;
++    return package_volume_create( volume );
++}
++
++static HRESULT WINAPI package_manager3_SetDefaultPackageVolume( IInspectable *iface, IPackageVolume *volume )
++{
++    FIXME( "iface %p, volume %p: the system volume stays the default.\n", iface, volume );
++    return S_OK;
++}
++
++static HRESULT WINAPI package_manager3_FindPackageVolumeByName( IInspectable *iface, HSTRING name, IPackageVolume **volume )
++{
++    TRACE( "iface %p, name %s, volume %p.\n", iface, debugstr_hstring( name ), volume );
++    if (!volume) return E_POINTER;
++    return package_volume_create( volume );      /* there is one volume */
++}
++
++static HRESULT WINAPI package_manager3_FindPackageVolumes( IInspectable *iface, IIterable_PackageVolume **volumes )
++{
++    PROPVARIANT result = { 0 };
++    HRESULT hr;
++
++    TRACE( "iface %p, volumes %p.\n", iface, volumes );
++    if (!volumes) return E_POINTER;
++    *volumes = NULL;
++    if (FAILED(hr = get_package_volumes( NULL, NULL, &result, FALSE ))) return hr;
++    hr = IUnknown_QueryInterface( result.punkVal, &IID_IIterable_PackageVolume, (void **)volumes );
++    IUnknown_Release( result.punkVal );
++    return hr;
++}
++
++/* in IPackageManager3's order */
++static const void *const package_manager3_vtbl[] =
++{
++    package_manager3_QueryInterface,
++    package_manager3_AddRef,
++    package_manager3_Release,
++    package_manager3_GetIids,
++    package_manager3_GetRuntimeClassName,
++    package_manager3_GetTrustLevel,
++    package_manager3_AddPackageVolumeAsync,
++    package_manager3_AddPackageToVolumeAsync,
++    package_manager3_ClearPackageStatus,
++    package_manager3_RegisterPackageWithAppDataVolumeAsync,
++    package_manager3_FindPackageVolumeByName,
++    package_manager3_FindPackageVolumes,
++    package_manager3_GetDefaultPackageVolume,
++    package_manager3_MovePackageToVolumeAsync,
++    package_manager3_RemovePackageVolumeAsync,
++    package_manager3_SetDefaultPackageVolume,
++    package_manager3_SetPackageStatus,
++    package_manager3_SetPackageVolumeOfflineAsync,
++    package_manager3_SetPackageVolumeOnlineAsync,
++    package_manager3_StagePackageToVolumeAsync,
++    package_manager3_StageUserDataWithOptionsAsync,
++};
++
+ static const struct IPackageManager4Vtbl package_manager4_vtbl =
+ {
+     package_manager4_QueryInterface,
+@@ -586,6 +738,7 @@
+     impl->IPackageManager_iface.lpVtbl = &package_manager_vtbl;
+     impl->IPackageManager2_iface.lpVtbl = &package_manager2_vtbl;
+     impl->IPackageManager4_iface.lpVtbl = &package_manager4_vtbl;
++    impl->IPackageManager3_iface.lpVtbl = (const struct IInspectableVtbl *)package_manager3_vtbl;
+     impl->ref = 1;
+ 
+     *instance = (IInspectable *)&impl->IPackageManager_iface;
+--- /dev/null
++++ b/dlls/appxdeploymentclient/deploy.c
+@@ -0,0 +1,612 @@
++/* PackageManager.AddPackageAsync for stand-in packages
++ *
++ * Copyright 2026 wine-uwp contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++/*
++ * An app that installs a platform component itself (the Xbox app installs or updates Gaming Services from the
++ * gamingservices-signed.appxbundle it carries) gets that component's stand-in identity (standin.c) raised to the
++ * version it ships, and a deployment that succeeded: the component's client API is wine-uwp's own, so there is
++ * nothing else to install. Any other package still is not deployed from here.
++ */
++
++#include <ctype.h>
++#include <stdlib.h>
++#include <zlib.h>
++
++#include "private.h"
++#include "shlwapi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(appx);
++
++#define STANDIN_KEY L"Software\\Wine\\WineUWP\\StandInPackages"
++
++/* ---- the manifest of a .appx / .appxbundle file (zip, maybe zip64) ---- */
++
++static BOOL read_at( HANDLE file, UINT64 offset, void *buf, DWORD size )
++{
++    LARGE_INTEGER pos;
++    DWORD got;
++
++    pos.QuadPart = offset;
++    return SetFilePointerEx( file, pos, NULL, FILE_BEGIN ) && ReadFile( file, buf, size, &got, NULL ) && got == size;
++}
++
++static UINT16 u16( const BYTE *p ) { return p[0] | p[1] << 8; }
++static UINT32 u32( const BYTE *p ) { return u16( p ) | (UINT32)u16( p + 2 ) << 16; }
++static UINT64 u64( const BYTE *p ) { return u32( p ) | (UINT64)u32( p + 4 ) << 32; }
++
++/* Wine's zlib has no default allocator */
++static void *zalloc( void *opaque, unsigned int items, unsigned int size ) { return calloc( items, size ); }
++static void zfree( void *opaque, void *ptr ) { free( ptr ); }
++
++/* the named member, inflated and NUL-terminated */
++static char *zip_member( HANDLE file, const char *wanted )
++{
++    BYTE tail[65536 + 22], local[30], *dir = NULL, *p, *end;
++    UINT64 size, dir_offset = 0, dir_size = 0, data_offset = 0, csize = 0, usize = 0;
++    LARGE_INTEGER file_size;
++    DWORD tail_len, i;
++    char *out = NULL, *raw = NULL;
++    UINT16 method = 0;
++    BOOL found = FALSE;
++
++    if (!GetFileSizeEx( file, &file_size )) return NULL;
++    size = file_size.QuadPart;
++    tail_len = size < sizeof(tail) ? size : sizeof(tail);
++    if (tail_len < 22 || !read_at( file, size - tail_len, tail, tail_len )) return NULL;
++    for (i = tail_len - 22; ; i--)
++    {
++        if (u32( tail + i ) == 0x06054b50)
++        {
++            dir_size = u32( tail + i + 12 );
++            dir_offset = u32( tail + i + 16 );
++            /* zip64: the locator right before the end record points at the zip64 end record */
++            if (i >= 20 && u32( tail + i - 20 ) == 0x07064b50)
++            {
++                BYTE end64[56];
++                if (read_at( file, u64( tail + i - 12 ), end64, sizeof(end64) ) && u32( end64 ) == 0x06064b50)
++                {
++                    dir_size = u64( end64 + 40 );
++                    dir_offset = u64( end64 + 48 );
++                }
++            }
++            break;
++        }
++        if (!i) return NULL;
++    }
++    if (!dir_size || dir_size > 64 << 20 || dir_offset + dir_size > size || !(dir = malloc( dir_size ))) return NULL;
++    if (!read_at( file, dir_offset, dir, dir_size )) goto done;
++
++    for (p = dir, end = dir + dir_size; p + 46 <= end && u32( p ) == 0x02014b50; )
++    {
++        UINT16 name_len = u16( p + 28 ), extra_len = u16( p + 30 ), comment_len = u16( p + 32 );
++        if (p + 46 + name_len + extra_len > end) break;
++        if (name_len == strlen( wanted ) && !_strnicmp( (char *)p + 46, wanted, name_len ))
++        {
++            const BYTE *x = p + 46 + name_len, *xend = x + extra_len;
++            method = u16( p + 10 );
++            csize = u32( p + 20 );
++            usize = u32( p + 24 );
++            data_offset = u32( p + 42 );
++            for (; x + 4 <= xend; x += 4 + u16( x + 2 ))
++            {
++                const BYTE *v = x + 4, *vend = v + u16( x + 2 );
++                if (u16( x ) != 1 || vend > xend) continue;
++                /* zip64 extra field: the 64-bit values of the fields that were 0xffffffff, in this order */
++                if (usize == 0xffffffff && v + 8 <= vend) { usize = u64( v ); v += 8; }
++                if (csize == 0xffffffff && v + 8 <= vend) { csize = u64( v ); v += 8; }
++                if (data_offset == 0xffffffff && v + 8 <= vend) data_offset = u64( v );
++            }
++            found = TRUE;
++            break;
++        }
++        p += 46 + name_len + extra_len + comment_len;
++    }
++    if (!found || usize > 16 << 20 || csize > 16 << 20 || (method != 0 && method != 8)) goto done;
++    if (!read_at( file, data_offset, local, sizeof(local) ) || u32( local ) != 0x04034b50) goto done;
++    data_offset += 30 + u16( local + 26 ) + u16( local + 28 );
++    if (!(raw = malloc( csize + 1 )) || !(out = malloc( usize + 1 ))) goto fail;
++    if (!read_at( file, data_offset, raw, csize )) goto fail;
++    if (method == 0)
++    {
++        if (csize != usize) goto fail;
++        memcpy( out, raw, usize );
++    }
++    else
++    {
++        z_stream z = { 0 };
++        int ret;
++
++        z.zalloc = zalloc;
++        z.zfree = zfree;
++        z.next_in = (BYTE *)raw;
++        z.avail_in = csize;
++        z.next_out = (BYTE *)out;
++        z.avail_out = usize;
++        if (inflateInit2( &z, -15 ) != Z_OK) goto fail;
++        ret = inflate( &z, Z_FINISH );
++        inflateEnd( &z );
++        if (ret != Z_STREAM_END || z.total_out != usize) goto fail;
++    }
++    out[usize] = 0;
++    goto done;
++
++fail:
++    free( out );
++    out = NULL;
++done:
++    free( raw );
++    free( dir );
++    return out;
++}
++
++/* an attribute of the first <Identity> element */
++static BOOL identity_attr( const char *xml, const char *attr, WCHAR *buf, DWORD len )
++{
++    const char *id = strstr( xml, "<Identity" ), *close, *p;
++    size_t n = strlen( attr );
++
++    if (!id || !(close = strchr( id, '>' ))) return FALSE;
++    for (p = id; (p = strstr( p, attr )) && p < close; p += n)
++    {
++        const char *v, *e;
++        if (!isspace( (unsigned char)p[-1] ) || p[n] != '=' || (p[n + 1] != '"' && p[n + 1] != '\'')) continue;
++        v = p + n + 2;
++        if (!(e = strchr( v, p[n + 1] )) || e > close) return FALSE;
++        if (!MultiByteToWideChar( CP_UTF8, 0, v, e - v, buf, len - 1 )) return FALSE;
++        buf[min( (DWORD)(e - v), len - 1 )] = 0;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* the package file a file: URI names */
++static HANDLE open_uri( IUriRuntimeClass *uri )
++{
++    WCHAR path[MAX_PATH], *w;
++    const WCHAR *s;
++    HSTRING str = NULL;
++    HANDLE file = INVALID_HANDLE_VALUE;
++    DWORD len = ARRAY_SIZE(path);
++
++    if (FAILED(IUriRuntimeClass_get_AbsoluteUri( uri, &str ))) return file;
++    s = WindowsGetStringRawBuffer( str, NULL );
++    if (!wcsnicmp( s, L"file:", 5 ) && SUCCEEDED(PathCreateFromUrlW( s, path, &len, 0 )))
++    {
++        for (w = path; *w; w++) if (*w == '/') *w = '\\';
++        file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    }
++    WindowsDeleteString( str );
++    return file;
++}
++
++static void parse_version( const WCHAR *s, UINT64 *v )
++{
++    unsigned int p[4] = { 0 };
++    swscanf( s, L"%u.%u.%u.%u", &p[0], &p[1], &p[2], &p[3] );
++    *v = (UINT64)p[0] << 48 | (UINT64)(p[1] & 0xffff) << 32 | (UINT64)(p[2] & 0xffff) << 16 | (p[3] & 0xffff);
++}
++
++static const WCHAR *arch_name( DWORD arch )
++{
++    switch (arch)
++    {
++    case 0: return L"x86";
++    case 5: return L"arm";
++    case 11: return L"neutral";
++    case 12: return L"arm64";
++    default: return L"x64";
++    }
++}
++
++/* S_OK: the package is a stand-in, now at least at its version; S_FALSE: it is not one */
++static HRESULT standin_deploy( IUriRuntimeClass *uri )
++{
++    WCHAR name[128], version[64], sub[256], have_name[128], have_version[64], pid[32], full[512];
++    HANDLE file;
++    char *xml;
++    HKEY root, key;
++    DWORD i, len, arch;
++    UINT64 want, have;
++    HRESULT hr = S_FALSE;
++
++    if (!uri || (file = open_uri( uri )) == INVALID_HANDLE_VALUE)
++    {
++        TRACE( "not a package file this can open\n" );
++        return S_FALSE;
++    }
++    if (!(xml = zip_member( file, "AppxMetadata/AppxBundleManifest.xml" ))) xml = zip_member( file, "AppxManifest.xml" );
++    CloseHandle( file );
++    if (!xml)
++    {
++        WARN( "no manifest found in the package\n" );
++        return S_FALSE;
++    }
++    if (!identity_attr( xml, "Name", name, ARRAY_SIZE(name) ) ||
++        !identity_attr( xml, "Version", version, ARRAY_SIZE(version) ))
++    {
++        free( xml );
++        return S_FALSE;
++    }
++    free( xml );
++    TRACE( "package %s %s\n", debugstr_w(name), debugstr_w(version) );
++
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, STANDIN_KEY, 0, KEY_READ, &root )) return S_FALSE;
++    for (i = 0; len = ARRAY_SIZE(sub), !RegEnumKeyExW( root, i, sub, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        if (RegOpenKeyExW( root, sub, 0, KEY_READ | KEY_SET_VALUE, &key )) continue;
++        len = sizeof(have_name);
++        if (RegGetValueW( key, NULL, L"Name", RRF_RT_REG_SZ, NULL, have_name, &len ) || wcsicmp( have_name, name ))
++        {
++            RegCloseKey( key );
++            continue;
++        }
++        len = sizeof(have_version);
++        if (RegGetValueW( key, NULL, L"Version", RRF_RT_REG_SZ, NULL, have_version, &len )) have_version[0] = 0;
++        parse_version( version, &want );
++        parse_version( have_version, &have );
++        if (want > have)
++        {
++            len = sizeof(pid);
++            if (RegGetValueW( key, NULL, L"PublisherId", RRF_RT_REG_SZ, NULL, pid, &len )) pid[0] = 0;
++            len = sizeof(arch);
++            if (RegGetValueW( key, NULL, L"Architecture", RRF_RT_REG_DWORD, NULL, &arch, &len )) arch = 9;
++            swprintf( full, ARRAY_SIZE(full), L"%s_%s_%s__%s", have_name, version, arch_name( arch ), pid );
++            RegSetValueExW( key, L"Version", 0, REG_SZ, (BYTE *)version, (wcslen( version ) + 1) * sizeof(WCHAR) );
++            RegSetValueExW( key, L"FullName", 0, REG_SZ, (BYTE *)full, (wcslen( full ) + 1) * sizeof(WCHAR) );
++            FIXME( "stand-in %s: %s -> %s; its client API is wine-uwp's, nothing else is installed\n",
++                   debugstr_w(sub), debugstr_w(have_version), debugstr_w(version) );
++        }
++        else TRACE( "stand-in %s is already at %s\n", debugstr_w(sub), debugstr_w(have_version) );
++        RegCloseKey( key );
++        hr = S_OK;
++        break;
++    }
++    RegCloseKey( root );
++    return hr;
++}
++
++/* ---- DeploymentResult ---- */
++
++static const GUID IID_IDeploymentResult2_ = {0xfc0e715c,0x5a01,0x4bd7,{0xbc,0xf1,0x38,0x1c,0x8c,0x82,0xe0,0x4a}};
++
++struct result
++{
++    IDeploymentResult IDeploymentResult_iface;
++    IInspectable IDeploymentResult2_iface;
++    LONG ref;
++};
++
++static struct result *impl_from_IDeploymentResult( IDeploymentResult *iface )
++{
++    return CONTAINING_RECORD( iface, struct result, IDeploymentResult_iface );
++}
++
++static HRESULT WINAPI result_QueryInterface( IDeploymentResult *iface, REFIID iid, void **out )
++{
++    struct result *impl = impl_from_IDeploymentResult( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IDeploymentResult ))
++        *out = &impl->IDeploymentResult_iface;
++    else if (IsEqualGUID( iid, &IID_IDeploymentResult2_ ))
++        *out = &impl->IDeploymentResult2_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI result_AddRef( IDeploymentResult *iface )
++{
++    return InterlockedIncrement( &impl_from_IDeploymentResult( iface )->ref );
++}
++
++static ULONG WINAPI result_Release( IDeploymentResult *iface )
++{
++    struct result *impl = impl_from_IDeploymentResult( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI result_GetIids( IDeploymentResult *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++
++static HRESULT WINAPI result_GetRuntimeClassName( IDeploymentResult *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Management.Deployment.DeploymentResult", 46, name );
++}
++
++static HRESULT WINAPI result_GetTrustLevel( IDeploymentResult *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI result_get_ErrorText( IDeploymentResult *iface, HSTRING *value )
++{
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI result_get_ActivityId( IDeploymentResult *iface, GUID *value )
++{
++    memset( value, 0, sizeof(*value) );
++    return S_OK;
++}
++
++static HRESULT WINAPI result_get_ExtendedErrorCode( IDeploymentResult *iface, HRESULT *value )
++{
++    *value = S_OK;
++    return S_OK;
++}
++
++static const struct IDeploymentResultVtbl result_vtbl =
++{
++    result_QueryInterface, result_AddRef, result_Release,
++    result_GetIids, result_GetRuntimeClassName, result_GetTrustLevel,
++    result_get_ErrorText, result_get_ActivityId, result_get_ExtendedErrorCode,
++};
++
++static struct result *impl_from_result2( IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct result, IDeploymentResult2_iface );
++}
++static HRESULT WINAPI result2_QueryInterface( IInspectable *iface, REFIID iid, void **out )
++{
++    return result_QueryInterface( &impl_from_result2( iface )->IDeploymentResult_iface, iid, out );
++}
++static ULONG WINAPI result2_AddRef( IInspectable *iface )
++{
++    return result_AddRef( &impl_from_result2( iface )->IDeploymentResult_iface );
++}
++static ULONG WINAPI result2_Release( IInspectable *iface )
++{
++    return result_Release( &impl_from_result2( iface )->IDeploymentResult_iface );
++}
++static HRESULT WINAPI result2_GetIids( IInspectable *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI result2_GetRuntimeClassName( IInspectable *iface, HSTRING *name )
++{
++    return result_GetRuntimeClassName( &impl_from_result2( iface )->IDeploymentResult_iface, name );
++}
++static HRESULT WINAPI result2_GetTrustLevel( IInspectable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI result2_get_IsRegistered( IInspectable *iface, boolean *value )
++{
++    *value = TRUE;
++    return S_OK;
++}
++
++/* IDeploymentResult2: IsRegistered */
++static const void *const result2_vtbl[] =
++{
++    result2_QueryInterface, result2_AddRef, result2_Release,
++    result2_GetIids, result2_GetRuntimeClassName, result2_GetTrustLevel,
++    result2_get_IsRegistered,
++};
++
++/* ---- a deployment that has already completed ---- */
++
++struct deploy_op
++{
++    IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress IAsyncOperationWithProgress_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    BOOL closed;
++    IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress *handler;
++    IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress *progress;
++};
++
++static struct deploy_op *impl_from_op( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    return CONTAINING_RECORD( iface, struct deploy_op, IAsyncOperationWithProgress_iface );
++}
++
++static HRESULT WINAPI op_QueryInterface( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                         REFIID iid, void **out )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress ))
++        *out = &impl->IAsyncOperationWithProgress_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI op_AddRef( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    return InterlockedIncrement( &impl_from_op( iface )->ref );
++}
++
++static ULONG WINAPI op_Release( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_Release( impl->handler );
++        if (impl->progress) IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_Release( impl->progress );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI op_GetIids( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface, ULONG *count,
++                                  IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI op_GetRuntimeClassName( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                              HSTRING *name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI op_GetTrustLevel( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                        TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI op_put_Progress( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                       IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress *handler )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++    /* kept, never called: the deployment completed before the handler was set */
++    if (impl->progress) IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_Release( impl->progress );
++    if ((impl->progress = handler)) IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_AddRef( handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_get_Progress( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                       IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress **handler )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++    if ((*handler = impl->progress)) IAsyncOperationProgressHandler_DeploymentResult_DeploymentProgress_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_put_Completed( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                        IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress *handler )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if (!handler) return S_OK;
++    IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_AddRef( (impl->handler = handler) );
++    /* already complete: the handler runs now */
++    IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_Invoke( handler, iface, Completed );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_get_Completed( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                        IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress **handler )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++    if ((*handler = impl->handler)) IAsyncOperationWithProgressCompletedHandler_DeploymentResult_DeploymentProgress_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI op_GetResults( IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress *iface,
++                                     IDeploymentResult **results )
++{
++    struct deploy_op *impl = impl_from_op( iface );
++    struct result *result;
++
++    if (impl->closed) return E_ILLEGAL_METHOD_CALL;
++    if (!(result = calloc( 1, sizeof(*result) ))) return E_OUTOFMEMORY;
++    result->IDeploymentResult_iface.lpVtbl = &result_vtbl;
++    result->IDeploymentResult2_iface.lpVtbl = (const struct IInspectableVtbl *)result2_vtbl;
++    result->ref = 1;
++    *results = &result->IDeploymentResult_iface;
++    return S_OK;
++}
++
++static const struct IAsyncOperationWithProgress_DeploymentResult_DeploymentProgressVtbl op_vtbl =
++{
++    op_QueryInterface, op_AddRef, op_Release,
++    op_GetIids, op_GetRuntimeClassName, op_GetTrustLevel,
++    op_put_Progress, op_get_Progress, op_put_Completed, op_get_Completed, op_GetResults,
++};
++
++static struct deploy_op *impl_from_IAsyncInfo( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct deploy_op, IAsyncInfo_iface );
++}
++
++static HRESULT WINAPI info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    return op_QueryInterface( &impl_from_IAsyncInfo( iface )->IAsyncOperationWithProgress_iface, iid, out );
++}
++static ULONG WINAPI info_AddRef( IAsyncInfo *iface )
++{
++    return op_AddRef( &impl_from_IAsyncInfo( iface )->IAsyncOperationWithProgress_iface );
++}
++static ULONG WINAPI info_Release( IAsyncInfo *iface )
++{
++    return op_Release( &impl_from_IAsyncInfo( iface )->IAsyncOperationWithProgress_iface );
++}
++static HRESULT WINAPI info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++static HRESULT WINAPI info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    if (impl_from_IAsyncInfo( iface )->closed) return E_ILLEGAL_METHOD_CALL;
++    *status = Completed;
++    return S_OK;
++}
++static HRESULT WINAPI info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )
++{
++    if (impl_from_IAsyncInfo( iface )->closed) return E_ILLEGAL_METHOD_CALL;
++    *error = S_OK;
++    return S_OK;
++}
++static HRESULT WINAPI info_Cancel( IAsyncInfo *iface )
++{
++    return impl_from_IAsyncInfo( iface )->closed ? E_ILLEGAL_METHOD_CALL : S_OK;
++}
++static HRESULT WINAPI info_Close( IAsyncInfo *iface )
++{
++    impl_from_IAsyncInfo( iface )->closed = TRUE;
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl info_vtbl =
++{
++    info_QueryInterface, info_AddRef, info_Release,
++    info_GetIids, info_GetRuntimeClassName, info_GetTrustLevel,
++    info_get_Id, info_get_Status, info_get_ErrorCode, info_Cancel, info_Close,
++};
++
++/* AddPackageAsync and its overloads: E_NOTIMPL unless the package is a stand-in */
++HRESULT deploy_package( IUriRuntimeClass *uri, IAsyncOperationWithProgress_DeploymentResult_DeploymentProgress **out )
++{
++    struct deploy_op *op;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if ((hr = standin_deploy( uri )) != S_OK) return FAILED(hr) ? hr : E_NOTIMPL;
++    if (!(op = calloc( 1, sizeof(*op) ))) return E_OUTOFMEMORY;
++    op->IAsyncOperationWithProgress_iface.lpVtbl = &op_vtbl;
++    op->IAsyncInfo_iface.lpVtbl = &info_vtbl;
++    op->ref = 1;
++    *out = &op->IAsyncOperationWithProgress_iface;
++    return S_OK;
++}
+--- a/dlls/winexboxauth/identity.c
++++ b/dlls/winexboxauth/identity.c
+@@ -79,6 +79,56 @@
+ static const void *state_args_vtbl[] = { OBJ_METHODS(0), state_args_get_Type, state_args_TryGetDeferral };
+ static const void *state_args_user_vtbl[] = { OBJ_METHODS(1), state_args_get_User };
+ 
++/* ---- Which version of the API the app was built against ----
++ *
++ * IUser and IXboxAuthManager keep their (name-derived) IIDs while Gaming Services adds methods in the middle of
++ * them, so the vtable an app calls through depends on the Microsoft.GamePlatform.Services.winmd its projection was
++ * generated from. Each package ships that winmd at its root: the Microsoft Store's lacks User.LocalId and
++ * XboxAuthManager.RestartApps, the Xbox app's has both. With no winmd in the package the newer layout is used.
++ */
++static BOOL package_winmd_has( const char *name )
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    static char *winmd;
++    static DWORD winmd_size;
++    BOOL pending = FALSE;
++    DWORD i, len = strlen( name );
++
++    if (InitOnceBeginInitialize( &once, 0, &pending, NULL ) && pending)
++    {
++        WCHAR path[MAX_PATH];
++        DWORD n = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, MAX_PATH );
++        HANDLE file;
++
++        if (n && n < MAX_PATH - 48)
++        {
++            if (path[n - 1] != '\\') wcscat( path, L"\\" );
++            wcscat( path, L"Microsoft.GamePlatform.Services.winmd" );
++            file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE)
++            {
++                DWORD size = GetFileSize( file, NULL ), got = 0;
++                if (size != INVALID_FILE_SIZE && size < 64 << 20 && (winmd = malloc( size )) &&
++                    ReadFile( file, winmd, size, &got, NULL ) && got == size)
++                    winmd_size = size;
++                else
++                {
++                    free( winmd );
++                    winmd = NULL;
++                }
++                CloseHandle( file );
++            }
++        }
++        TRACE( "package winmd: %s\n", winmd ? "found" : "none, using the newer layouts" );
++        InitOnceComplete( &once, 0, NULL );
++    }
++    if (!winmd) return TRUE;
++    /* a name in the #Strings heap: NUL on both sides */
++    for (i = 1; i + len < winmd_size; i++)
++        if (!winmd[i - 1] && !winmd[i + len] && !memcmp( winmd + i, name, len )) return TRUE;
++    return FALSE;
++}
++
+ /* ---- User ---- */
+ 
+ struct modern_gamertag { HSTRING modern, suffix, unique; };
+@@ -161,6 +211,21 @@
+     return field_hstr( &account.xid, v );
+ }
+ 
++static HRESULT WINAPI user_get_LocalId( void *iface, UINT64 *v )
++{
++    /* one signed-in user per process: the first local user id, as XUserLocalId would number it */
++    if (!v) return E_POINTER;
++    *v = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI user_get_NonRoamableId( void *iface, HSTRING *v )
++{
++    /* a per-device id for the user; the XUID identifies this one user on this device as well */
++    TRACE( "User.NonRoamableId\n" );
++    return field_hstr( &account.xid, v );
++}
++
+ static HRESULT WINAPI user_get_AgeGroup( void *iface, INT32 *v )
+ {
+     char *a;
+@@ -347,6 +412,17 @@
+     return msa_ticket( scope, force, out );
+ }
+ 
++/* the ticket comes from the stored sign-in; when that needs the user, msa_ticket fails as the silent call does */
++static HRESULT WINAPI user_GetMsaTicketWithUiAsync( void *iface, HSTRING scope, void **out )
++{
++    return msa_ticket( scope, FALSE, out );
++}
++
++static HRESULT WINAPI user_GetMsaTicketWithUiAsync2( void *iface, HSTRING scope, boolean force, void **out )
++{
++    return msa_ticket( scope, force, out );
++}
++
+ static HRESULT WINAPI user_GetGamerPictureAsync( void *iface, INT32 size, void **out )
+ {
+     TRACE( "User.GetGamerPictureAsync(%d) -> E_NOTIMPL\n", size );
+@@ -474,13 +550,16 @@
+     return events_remove( &user_from( iface )->picture_changed, t );
+ }
+ 
++/* IUser as current Gaming Services declares it (the Xbox app) */
+ static const void *user_vtbl[] =
+ {
+     OBJ_METHODS(0),
+     user_get_Gamertag,
+     user_get_ModernGamertagProperties,
++    user_get_LocalId,
+     user_get_Xuid,
+     user_get_XuidStr,
++    user_get_NonRoamableId,
+     user_get_AgeGroup,
+     user_get_State,
+     user_get_IsStoreUser,
+@@ -489,6 +568,36 @@
+     user_GetTokenAndSignatureAsync,
+     user_GetMsaTicketAsync,
+     user_GetMsaTicketAsync2,
++    user_GetMsaTicketWithUiAsync,
++    user_GetMsaTicketWithUiAsync2,
++    user_GetGamerPictureAsync,
++    user_ResolveUserIssueWithUiAsync,
++    user_CheckConsent,
++    user_ManageConsentWithUi,
++    user_SignOutAsync,
++    user_add_UserStateChanged,
++    user_remove_UserStateChanged,
++    user_add_UserPropertiesChanged,
++    user_remove_UserPropertiesChanged,
++    user_add_UserGamerPictureChanged,
++    user_remove_UserGamerPictureChanged,
++};
++
++/* the older IUser (the Microsoft Store's winmd): no LocalId, NonRoamableId or second GetMsaTicket overloads */
++static const void *user_vtbl_old[] =
++{
++    OBJ_METHODS(0),
++    user_get_Gamertag,
++    user_get_ModernGamertagProperties,
++    user_get_Xuid,
++    user_get_XuidStr,
++    user_get_AgeGroup,
++    user_get_State,
++    user_get_IsStoreUser,
++    user_get_WebAccountId,
++    user_CheckPrivilege,
++    user_GetTokenAndSignatureAsync,
++    user_GetMsaTicketAsync,
+     user_GetGamerPictureAsync,
+     user_ResolveUserIssueWithUiAsync,
+     user_CheckConsent,
+@@ -513,7 +622,7 @@
+         (current_user = object_create( sizeof(*current_user), L"Microsoft.GamePlatform.Services.Identity.User", "User",
+                                        user_destroy )))
+     {
+-        object_add( &current_user->obj, user_vtbl, &IID_IUser );
++        object_add( &current_user->obj, package_winmd_has( "get_LocalId" ) ? user_vtbl : user_vtbl_old, &IID_IUser );
+         object_add( &current_user->obj, user_closable_vtbl, &IID_IClosable_ );
+         events_init( &current_user->state_changed );
+         events_init( &current_user->properties_changed );
+@@ -793,6 +902,27 @@
+     return start_user_op( "AddUserWithUiAsync", add_ui_work, out );
+ }
+ 
++static HRESULT WINAPI manager_RestartApps( void *iface, boolean all )
++{
++    /* asks Gaming Services to restart the apps using the sign-in; nothing here keeps a sign-in across apps */
++    FIXME( "XboxAuthManager.RestartApps(%d): nothing to restart\n", all );
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_GetMsaTicketForStoreUserAsync( void *iface, INT32 options, HSTRING scope, void **out )
++{
++    /* the Store user is this user (User.IsStoreUser) */
++    TRACE( "XboxAuthManager.GetMsaTicketForStoreUserAsync(%d)\n", options );
++    return msa_ticket( scope, FALSE, out );
++}
++
++static HRESULT WINAPI manager_GetStoreAccountPropertiesAsync( void *iface, void **out )
++{
++    FIXME( "XboxAuthManager.GetStoreAccountPropertiesAsync -> E_NOTIMPL\n" );
++    if (out) *out = NULL;
++    return E_NOTIMPL;
++}
++
+ static HRESULT WINAPI manager_GetDeviceUserAsync( void *iface, void **out )
+ {
+     /* a device identity needs an Xbox device token and a proof key of its own; this has neither */
+@@ -801,10 +931,25 @@
+     return E_NOTIMPL;
+ }
+ 
++/* IXboxAuthManager as current Gaming Services declares it */
+ static const void *manager_vtbl[] =
+ {
+     OBJ_METHODS(0),
+     manager_get_Sandbox,
++    manager_RestartApps,
++    manager_TryAddDefaultUserSilentlyAsync,
++    manager_AddUserWithOptionalUiAsync,
++    manager_AddUserWithUiAsync,
++    manager_GetDeviceUserAsync,
++    manager_GetMsaTicketForStoreUserAsync,
++    manager_GetStoreAccountPropertiesAsync,
++};
++
++/* the older one (the Microsoft Store's winmd): no RestartApps */
++static const void *manager_vtbl_old[] =
++{
++    OBJ_METHODS(0),
++    manager_get_Sandbox,
+     manager_TryAddDefaultUserSilentlyAsync,
+     manager_AddUserWithOptionalUiAsync,
+     manager_AddUserWithUiAsync,
+@@ -862,7 +1007,7 @@
+     if (!(manager = object_create( sizeof(*manager), L"Microsoft.GamePlatform.Services.Identity.XboxAuthManager",
+                                    "XboxAuthManager", NULL )))
+         return E_OUTOFMEMORY;
+-    object_add( manager, manager_vtbl, &IID_IXboxAuthManager );
++    object_add( manager, package_winmd_has( "RestartApps" ) ? manager_vtbl : manager_vtbl_old, &IID_IXboxAuthManager );
+     object_add( manager, manager_closable_vtbl, &IID_IClosable_ );
+     *out = &manager->vtbl[0];
+     return S_OK;
+@@ -885,7 +1030,29 @@
+ 
+ static const void *manager_activation_vtbl[] = { OBJ_METHODS(0), manager_factory_ActivateInstance };
+ static const void *manager_factory_vtbl[] = { OBJ_METHODS(1), manager_factory_CreateInstance };
+-static const void *manager_statics_vtbl[] = { OBJ_METHODS(2), manager_factory_AddUserWithTransferTokenAsync };
++static HRESULT WINAPI manager_statics_SetSandbox( void *iface, HSTRING name )
++{
++    FIXME( "XboxAuthManager.SetSandbox(%s): the sandbox stays RETAIL\n", debugstr_hstring( name ) );
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_statics_IsValidSandboxName( void *iface, HSTRING name, boolean *v )
++{
++    if (!v) return E_POINTER;
++    *v = WindowsGetStringLen( name ) > 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_statics_SignOutAllUsersAsync( void *iface, void **out )
++{
++    FIXME( "XboxAuthManager.SignOutAllUsersAsync -> E_NOTIMPL\n" );
++    if (out) *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const void *manager_statics_vtbl[] = { OBJ_METHODS(2), manager_factory_AddUserWithTransferTokenAsync,
++                                              manager_statics_SetSandbox, manager_statics_IsValidSandboxName,
++                                              manager_statics_SignOutAllUsersAsync };
+ 
+ IActivationFactory *xboxauth_manager_factory( void )
+ {
