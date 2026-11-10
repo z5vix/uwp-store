@@ -48,7 +48,9 @@ Command line, for scripting and debugging:
 ./uwp-store run windowscalculator
 ./uwp-store store                     # Microsoft Store app: newest offered vs installed per runtime
 ./uwp-store install 9WZDNCRFJBMP --runtime v1-runtime-wow64   # install/update it in one runtime
-./uwp-store signin | account | signout
+./uwp-store signin | account | switch GAMERTAG | signout [GAMERTAG]
+./uwp-store owners 9NXP44L49SHJ        # which signed-in accounts own a product
+./uwp-store xbox-account [GAMERTAG]   # which account the Xbox app uses, per runtime
 ./uwp-store menu                      # start-menu entries for installed apps (done automatically)
 ```
 
@@ -86,6 +88,27 @@ keyring it goes in `settings.json`, mode 0600. The header shows your gamertag (X
 signed in, package lookups carry a Store delivery ticket (scope `service::dcat.update.microsoft.com::MBI_SSL`), so the
 delivery service can offer the packages your account is licensed for.
 
+### Several accounts
+
+Sign in with as many accounts as you like, for example yours and a family member's, without signing anyone out
+(*Add another account…* in the person menu or Settings → Store). One is *active* (shown in the header; pick another
+from the menu). A paid product's page asks about every signed-in account, says which one owns it ("Owned by …"),
+and the install uses that account's delivery ticket. Each account's refresh token is its own keyring item; signing
+one out removes only that account, along with its saved Xbox app sign-ins.
+
+### The Xbox app with several accounts
+
+The Xbox app keeps its own sign-in in the prefix (Wine-UWP's `%LOCALAPPDATA%\wineuwp\xboxauth.bin`), and games
+started from it check their licence and Xbox Live sign-in with that same file. Wine-UWP has a
+`WINE_UWP_XBOXAUTH_STORE` override, but the Xbox app strips `WINE_UWP_*` variables from the games it starts, so
+the store swaps files instead (`uwpstore/xboxaccounts.py`). It keeps one copy of that file per account in
+`<profile>/xbox-accounts/<xuid>.bin` (mode 0600) and puts the wanted account's copy in place while nothing runs in
+that prefix. *Install in Xbox app* switches to the account that owns the game by itself. An account that has not used
+the Xbox app there yet gets an empty slot, so the app asks it to sign in once. Settings → Store → *Xbox app account*
+shows and sets the account per runtime. If the Xbox app is open as someone else, the store says so instead of
+switching under it. When someone signs in to a different account inside the Xbox app, the store notices (the
+`XboxLive\Xuid` the app publishes) and files that sign-in under the right account.
+
 ## Latest Microsoft Store
 
 [store.rg-adguard.net](https://store.rg-adguard.net) is a web front end for the Store's delivery service (FE3). Given
@@ -110,6 +133,7 @@ already harvested one (`~/.local/share/ms-store-uwp/data*/windows`), v2 uses it.
 | --- | --- |
 | `uwpstore/catalog.py` | `storeedgefd.dsx.mp.microsoft.com/v9.0`: page layouts (home, gaming), collections, search, product details, publisher installers. No account. |
 | `uwpstore/account.py` | Microsoft account: device-code sign-in, refresh token in the keyring, per-scope tickets, Xbox Live gamertag. |
+| `uwpstore/xboxaccounts.py` | Per-account Xbox app sign-ins: saved per account, swapped in while the app is closed. |
 | `uwpstore/desktop.py` | Start-menu entries for installed apps. |
 | `uwpstore/fe3.py` | The Store's package delivery (FE3, the Windows Update protocol): a product's WuCategoryId → every package and framework → signed CDN URLs. Anonymous for free products. |
 | `uwpstore/net.py` | HTTP with a disk cache (store opens offline from cache), resumable downloads, digest checks. The delivery hosts chain to *Microsoft Root Certificate Authority 2011*, which Linux CA bundles lack; that root (`microsoft-root-2011.pem`, SHA-256 `847DF6A7…ED7C61`) is trusted for `*.delivery.mp.microsoft.com` only. TLS verification is never disabled. |

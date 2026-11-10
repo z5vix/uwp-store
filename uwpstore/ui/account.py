@@ -80,61 +80,78 @@ class SignInDialog(Adw.Dialog):
 
 
 class AccountButton(Gtk.MenuButton):
-    """The header's account menu: sign in, or the gamertag and sign out."""
+    """The header's account menu: every signed-in account (pick the active one), add another, sign out."""
 
     def __init__(self, toast: Callable[[str], None]) -> None:
-        super().__init__(icon_name="avatar-default-symbolic", tooltip_text="Microsoft account")
+        super().__init__(icon_name="avatar-default-symbolic", tooltip_text="Microsoft accounts")
         self.toast = toast
-        self.listeners: list[Callable[[], None]] = []
         group = Gio.SimpleActionGroup()
-        for name, handler in (("signin", self.sign_in), ("signout", self.sign_out)):
-            action = Gio.SimpleAction.new(name, None)
-            action.connect("activate", lambda *_a, h=handler: h())
-            group.add_action(action)
+        add = Gio.SimpleAction.new("signin", None)
+        add.connect("activate", lambda *_a: self.sign_in())
+        group.add_action(add)
+        self.switch_action = Gio.SimpleAction.new_stateful("switch", GLib.VariantType.new("s"), GLib.Variant("s", ""))
+        self.switch_action.connect("activate", lambda _a, v: self.switch(v.get_string()))
+        group.add_action(self.switch_action)
+        out = Gio.SimpleAction.new("signout", GLib.VariantType.new("s"))
+        out.connect("activate", lambda _a, v: self.sign_out(v.get_string()))
+        group.add_action(out)
         self.insert_action_group("account", group)
         self.refresh()
-        if account.signed_in() and not account.cached_profile():
-            run_async(account.profile, lambda _p: self.refresh(), lambda _e: None)
+        missing = [a for a in account.accounts() if not a.gamertag]
+        for profile in missing:
+            run_async(lambda p=profile: account.profile(refresh=True, account_id=p.id), lambda _p: self.refresh(),
+                      lambda _e: None)
 
     def refresh(self) -> None:
+        found = account.accounts()
+        current = account.active()
         menu = Gio.Menu()
-        profile = account.cached_profile()
-        if account.signed_in():
-            name = profile.gamertag if profile and profile.gamertag else "Microsoft account"
-            self.set_tooltip_text(f"Signed in as {name}")
-            section = Gio.Menu()
-            section.append(f"Signed in as {name}", "account.none")
-            menu.append_section(None, section)
-            menu.append("Sign out", "account.signout")
-            self.set_icon_name("avatar-default-symbolic")
+        if found:
+            people = Gio.Menu()
+            for profile in found:
+                people.append(profile.name, f"account.switch::{profile.id}")
+            menu.append_section("Accounts" if len(found) > 1 else None, people)
+            actions = Gio.Menu()
+            actions.append("Add another account…", "account.signin")
+            if current:
+                actions.append(f"Sign out {current.name}", f"account.signout::{current.id}")
+            menu.append_section(None, actions)
+            self.switch_action.set_state(GLib.Variant("s", current.id if current else ""))
+            self.set_tooltip_text(f"Signed in as {current.name}" + (f" (+{len(found) - 1} more)" if len(found) > 1 else ""))
             self.add_css_class("accent")
         else:
-            self.set_tooltip_text("Sign in with a Microsoft account")
             menu.append("Sign in with Microsoft…", "account.signin")
+            self.set_tooltip_text("Sign in with a Microsoft account")
             self.remove_css_class("accent")
         self.set_menu_model(menu)
-        for listener in list(self.listeners):
-            listener()
 
     def sign_in(self) -> None:
         def done(profile: account.Profile) -> None:
             self.refresh()
-            self.toast(f"Signed in as {profile.gamertag or 'your Microsoft account'}")
+            self.toast(f"Signed in as {profile.name}")
         SignInDialog(done).present(self.get_root())
 
-    def sign_out(self) -> None:
-        account.sign_out()
+    def switch(self, account_id: str) -> None:
+        account.set_active(account_id)
         self.refresh()
-        self.toast("Signed out")
+        current = account.active()
+        if current:
+            self.toast(f"Active account: {current.name}")
+
+    def sign_out(self, account_id: str) -> None:
+        who = account.get(account_id)
+        account.sign_out(account_id)
+        if who and who.xuid:
+            from .. import xboxaccounts
+            xboxaccounts.forget_everywhere(who.xuid)
+        self.refresh()
+        self.toast(f"Signed out {who.name if who else ''}".strip())
 
 
 def status_text() -> str:
-    if not account.signed_in():
+    found = account.accounts()
+    if not found:
         return "Not signed in. Free apps and games install without an account."
-    profile = account.cached_profile()
-    who = profile.gamertag if profile and profile.gamertag else "a Microsoft account"
-    return f"Signed in as {who}"
-
-
-def idle(fn: Callable[[], None]) -> None:
-    GLib.idle_add(lambda: (fn(), GLib.SOURCE_REMOVE)[1])
+    current = account.active()
+    others = len(found) - 1
+    return f"Active: {current.name}" + (f", and {others} more signed in" if others else "")

@@ -21,9 +21,17 @@ def cli(argv: list[str]) -> int:
     i.add_argument("product_id")
     i.add_argument("--runtime", default="", help="runtime id (default: the app or game runtime from Settings)")
     sub.add_parser("store", help="Microsoft Store app: newest version offered vs installed")
-    sub.add_parser("signin", help="sign in with a Microsoft account (device code in your browser)")
-    sub.add_parser("signout", help="forget the Microsoft account")
-    sub.add_parser("account", help="show the signed-in account")
+    sub.add_parser("signin", help="sign in (or add another) Microsoft account (device code in your browser)")
+    so = sub.add_parser("signout", help="forget a Microsoft account (default: the active one)")
+    so.add_argument("account", nargs="?", default="", help="gamertag or xuid")
+    sub.add_parser("account", help="list signed-in accounts")
+    sw = sub.add_parser("switch", help="make another signed-in account the active one")
+    sw.add_argument("account", help="gamertag or xuid")
+    ow = sub.add_parser("owners", help="which signed-in accounts own a product")
+    ow.add_argument("product_id")
+    xb = sub.add_parser("xbox-account", help="show or set which account the Xbox app uses in each runtime")
+    xb.add_argument("account", nargs="?", default="", help="gamertag or xuid (omit to show)")
+    xb.add_argument("--runtime", default="")
     sub.add_parser("runtimes", help="list runtimes")
     sub.add_parser("apps", help="list installed apps")
     r = sub.add_parser("run", help="run an installed app (stage name or product id)")
@@ -76,16 +84,44 @@ def cli(argv: list[str]) -> int:
         webbrowser.open(code.link)
         profile = account.poll_device_code(code)
         print(f"Signed in as {profile.gamertag or profile.xuid or 'your Microsoft account'}")
+    elif args.cmd in ("signout", "switch", "xbox-account") and args.account and not _find_account(account, args.account):
+        print(f"no signed-in account {args.account}", file=sys.stderr)
+        return 1
     elif args.cmd == "signout":
-        account.sign_out()
-        print("Signed out")
-    elif args.cmd == "account":
-        if not account.signed_in():
+        from . import xboxaccounts
+        target = _find_account(account, args.account) if args.account else account.active()
+        if target is None:
             print("Not signed in")
-        else:
-            prof = account.profile()
-            print(f"gamertag {prof.gamertag}\nxuid     {prof.xuid}")
-            print("store delivery ticket: " + ("yes" if account.store_ticket() else "refused for this sign-in"))
+            return 1
+        account.sign_out(target.id)
+        if target.xuid:
+            xboxaccounts.forget_everywhere(target.xuid)
+        print(f"Signed out {target.name}")
+    elif args.cmd == "switch":
+        target = _find_account(account, args.account)
+        account.set_active(target.id)
+        print(f"Active account: {target.name}")
+    elif args.cmd == "account":
+        current = account.active()
+        if not current:
+            print("Not signed in")
+        for prof in account.accounts():
+            ticket = "delivery ticket ok" if account.store_ticket(prof.id) else "delivery ticket refused"
+            print(f"{'*' if prof.id == current.id else ' '} {prof.name:20} xuid {prof.xuid:18} {ticket}")
+    elif args.cmd == "owners":
+        found = account.owners(args.product_id)
+        print(", ".join(p.name for p in found) if found else "none of the signed-in accounts")
+    elif args.cmd == "xbox-account":
+        from . import xboxaccounts
+        for rt in xboxaccounts.runtimes_with_xbox_app():
+            if args.runtime and rt.id != args.runtime:
+                continue
+            if args.account:
+                target = _find_account(account, args.account)
+                xboxaccounts.switch(rt, target.xuid)
+            now = xboxaccounts.signed_in_as(rt)
+            who = account.get(now)
+            print(f"{rt.id:24} {who.name if who else (now or 'signed out')}")
     elif args.cmd == "runtimes":
         for rt in runtimes.discover():
             print(f"{rt.id:28} {rt.flavour:11} {'ready' if rt.ready() else 'not ready':10} {rt.name}")
@@ -108,6 +144,11 @@ def cli(argv: list[str]) -> int:
     else:
         parser.print_help()
     return 0
+
+
+def _find_account(account, name: str):
+    name = name.lower()
+    return next((a for a in account.accounts() if name in (a.gamertag.lower(), a.xuid, a.id.lower())), None)
 
 
 def main() -> int:

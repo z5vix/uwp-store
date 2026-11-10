@@ -8,7 +8,7 @@ from typing import Callable
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from .. import account, catalog, desktop, fe3, installer, packages, runtimes
+from .. import account, catalog, desktop, fe3, installer, packages, runtimes, xboxaccounts
 from . import widgets
 from .util import clear, human_size, load_image, run_async, stars
 
@@ -181,6 +181,7 @@ class ProductPage(Gtk.Box):
         self.product_id = product_id
         self.open_product = open_product
         self.owned: bool | None = None          # None: not known (signed out, or still asking)
+        self.owner: account.Profile | None = None   # the signed-in account that owns it
         self.offer_error = ""                   # why the delivery service has no installable package
         self.checking = False
         self.toast = toast
@@ -323,9 +324,11 @@ class ProductPage(Gtk.Box):
         self.checking = True
         self._refresh()
 
-        def done(owned: bool) -> None:
-            self.owned = owned
+        def done(found: list[account.Profile]) -> None:
+            self.owner = found[0] if found else None
+            self.owned = bool(found)
             self.checking = False
+            owned = self.owned
             if owned and self.product.category_id:
                 self._check_offer()
             else:
@@ -335,7 +338,7 @@ class ProductPage(Gtk.Box):
             self.checking = False
             self.toast(f"Couldn't check your licence: {error}")
             self._refresh()
-        run_async(lambda: account.owns(self.product.product_id), done, failed)
+        run_async(lambda: account.owners(self.product.product_id), done, failed)
 
     def _check_offer(self) -> None:
         """Ask the delivery service for the newest package, to offer an update over an older install."""
@@ -490,17 +493,17 @@ class ProductPage(Gtk.Box):
         elif entitled and self._via_xbox():
             if self._xbox_app():
                 self.button.set_label("Install in Xbox app")
-                self.status.set_label(("You own this. " if self.owned else "") +
+                self.status.set_label((f"Owned by {self.owner.name}. " if self.owner else "") +
                                       "Xbox PC games install through the Xbox app (sign in there once)")
             else:
                 self.button.set_label("Get the Xbox app")
                 self.status.set_label("Xbox PC games install through the Xbox app, which isn't installed yet")
         elif entitled:
             self.button.set_label("Get" if self.product.is_free else "Install")
-            self.status.set_label(failed or ("You own this" if self.owned else ""))
+            self.status.set_label(failed or (f"Owned by {self.owner.name}" if self.owner else ""))
         elif self.owned is False:
             self.button.set_label(self.product.price or "Buy")
-            self.status.set_label("Not owned by your account: buy on Microsoft's site")
+            self.status.set_label("None of your signed-in accounts owns this: buy on Microsoft's site")
         else:
             self.button.set_label(self.product.price or "Buy")
             self.status.set_label("Sign in (person icon) to install games you own, or buy on Microsoft's site")
@@ -537,15 +540,29 @@ class ProductPage(Gtk.Box):
                     self.open_product(installer.XBOX_APP_PRODUCT_ID, "Xbox")
                 return
             runtime, _app = xbox
+            owner = self.owner
+            try:
+                outcome = xboxaccounts.prepare_for(runtime, owner.xuid) if owner and owner.xuid else ""
+            except xboxaccounts.XboxAccountError:
+                current = account.get(xboxaccounts.signed_in_as(runtime))
+                self.toast(f"{owner.name} owns this, but the Xbox app is open as "
+                           f"{current.name if current else 'another account'}: close it and try again")
+                return
             runtime.activate(f"msxbox://game/?productId={self.product.product_id}")
-            self.toast(f"Opening {self.product.title} in the Xbox app")
+            if outcome == "sign-in":
+                self.toast(f"Opening the Xbox app: sign in there as {owner.name} (once), then Install")
+            elif outcome == "switched":
+                self.toast(f"Opening {self.product.title} in the Xbox app as {owner.name}")
+            else:
+                self.toast(f"Opening {self.product.title} in the Xbox app")
             return
         runtime = runtimes.runtime_for(self.product.is_game)
         if runtime is None or not runtime.ready():
             self.toast("Finish setting up a runtime first")
             self.open_settings()
             return
-        self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo, self.product.is_game)
+        self.job = installer.get().enqueue(self.product.product_id, self.product.title, logo, self.product.is_game,
+                                           account_id=self.owner.id if self.owner else "")
         self._refresh()
 
     def _job_changed(self, job: installer.Job) -> None:

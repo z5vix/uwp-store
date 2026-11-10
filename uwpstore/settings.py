@@ -17,7 +17,10 @@ DEFAULTS = {
     "keep_downloads": False,
     "app_shortcuts": True,        # put installed apps in the start menu
     "msa_refresh_token": "",     # only when no keyring is available (file is mode 0600)
-    "msa_profile": {},            # gamertag/xuid of the signed-in account; never tokens
+    "msa_profile": {},            # (earlier versions) the single signed-in account
+    "msa_accounts": [],           # signed-in accounts: gamertag, xuid, id; never tokens
+    "msa_active": "",             # id of the active account
+    "msa_refresh_tokens": {},     # id -> refresh token, only when no keyring is available (file is mode 0600)
 }
 
 _lock = threading.Lock()

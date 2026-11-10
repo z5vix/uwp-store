@@ -9,7 +9,7 @@ from typing import Callable, Iterator
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from .. import account, catalog, desktop, installer, net, packages, paths, runtimes, settings
+from .. import account, catalog, desktop, installer, net, xboxaccounts, packages, paths, runtimes, settings
 from . import account as ui_account
 from .util import human_size, run_async
 
@@ -213,6 +213,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._pages.append(store)
         self.add(store)
         store.add(self._account_group())
+        xbox = self._xbox_group()
+        if xbox is not None:
+            store.add(xbox)
         store.add(self._store_app_group(found))
         region = Adw.PreferencesGroup(title="Region")
         market = Adw.EntryRow(title="Market (country code)", text=cfg["market"], show_apply_button=True)
@@ -240,27 +243,84 @@ class SettingsDialog(Adw.PreferencesDialog):
 
     def _account_group(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(
-            title="Microsoft account",
-            description="Sign-in uses Microsoft's device-code page in your browser. The store keeps only a refresh "
-                        "token, in your keyring. It is used for licensed downloads and your gamertag.")
-        status = Adw.ActionRow(title=ui_account.status_text())
-        group.add(status)
-        if account.signed_in():
-            out = Adw.ButtonRow(title="Sign out")
-            out.add_css_class("destructive-action")
-            out.connect("activated", lambda *_: (account.sign_out(), self.changed(), self._build(),
-                                                 self.toast("Signed out")))
-            group.add(out)
-        else:
-            sign = Adw.ButtonRow(title="Sign in with Microsoft…")
-            sign.add_css_class("suggested-action")
+            title="Microsoft accounts",
+            description="Sign in with as many accounts as you like (yours, family members'): a game counts as owned "
+                        "when any of them owns it, and installs with that account's licence. Sign-in uses Microsoft's "
+                        "device-code page in your browser; the store keeps only a refresh token per account, in "
+                        "your keyring.")
+        current = account.active()
+        for profile in account.accounts():
+            row = Adw.ActionRow(title=profile.name, subtitle=f"xuid {profile.xuid}" if profile.xuid else "")
+            if current and profile.id == current.id:
+                badge = Gtk.Label(label="Active", valign=Gtk.Align.CENTER)
+                badge.add_css_class("dim-label")
+                row.add_suffix(badge)
+            else:
+                make = Gtk.Button(label="Make active", valign=Gtk.Align.CENTER)
+                make.add_css_class("flat")
+                make.connect("clicked", lambda _b, p=profile: (account.set_active(p.id), self.changed(), self._build()))
+                row.add_suffix(make)
+            out = Gtk.Button(label="Sign out", valign=Gtk.Align.CENTER, tooltip_text=f"Sign out {profile.name}")
+            out.add_css_class("flat")
+            out.connect("clicked", lambda _b, p=profile: (account.sign_out(p.id),
+                                                          p.xuid and xboxaccounts.forget_everywhere(p.xuid),
+                                                          self.changed(), self._build(),
+                                                          self.toast(f"Signed out {p.name}")))
+            row.add_suffix(out)
+            group.add(row)
+        sign = Adw.ButtonRow(title="Add another account…" if account.signed_in() else "Sign in with Microsoft…")
+        sign.add_css_class("suggested-action")
 
-            def done(profile: account.Profile) -> None:
-                self.changed()
-                self._build()
-                self.toast(f"Signed in as {profile.gamertag or 'your Microsoft account'}")
-            sign.connect("activated", lambda *_: ui_account.SignInDialog(done).present(self))
-            group.add(sign)
+        def done(profile: account.Profile) -> None:
+            self.changed()
+            self._build()
+            self.toast(f"Signed in as {profile.name}")
+        sign.connect("activated", lambda *_: ui_account.SignInDialog(done).present(self))
+        group.add(sign)
+        return group
+
+    def _xbox_group(self) -> Adw.PreferencesGroup | None:
+        """Which account the Xbox app (and the games it starts) uses in each runtime that has it."""
+        found = xboxaccounts.runtimes_with_xbox_app()
+        if not found:
+            return None
+        group = Adw.PreferencesGroup(
+            title="Xbox app account",
+            description="The Xbox app keeps its own sign-in, and games started from it check their licence with that "
+                        "account. The store keeps one Xbox app sign-in per account and swaps it in while the Xbox app "
+                        "is closed; Install in Xbox app picks the account that owns the game by itself.")
+        people = account.accounts()
+        for runtime in found:
+            current = xboxaccounts.signed_in_as(runtime)
+            saved = xboxaccounts.known(runtime)
+            labels = [p.name + ("" if p.xuid in saved else " (will ask to sign in)") for p in people]
+            ids = [p.xuid for p in people]
+            if current and current not in ids:
+                labels.append(f"Someone else (xuid {current})")
+                ids.append(current)
+            labels.append("Signed out")
+            ids.append("")
+            row = Adw.ComboRow(title=runtime.name, model=Gtk.StringList.new(labels))
+            row.set_selected(ids.index(current) if current in ids else len(ids) - 1)
+            row.set_subtitle("The Xbox app is open: close it to switch" if xboxaccounts.busy(runtime) else "")
+
+            def chosen(combo, _p, rt=runtime, ids=ids, before=current):
+                target = ids[combo.get_selected()]
+                if target == xboxaccounts.signed_in_as(rt):
+                    return
+                try:
+                    if target:
+                        xboxaccounts.switch(rt, target)
+                    else:
+                        xboxaccounts.sign_out_here(rt)
+                    who = account.get(target)
+                    self.toast(f"Xbox app in {rt.name}: {who.name if who else ('signed out' if not target else target)}")
+                except xboxaccounts.XboxAccountError as exc:
+                    self.toast(str(exc))
+                    GLib.idle_add(lambda: (combo.set_selected(ids.index(before) if before in ids else len(ids) - 1),
+                                           GLib.SOURCE_REMOVE)[1])
+            row.connect("notify::selected", chosen)
+            group.add(row)
         return group
 
     def _store_app_group(self, found: list[runtimes.Runtime]) -> Adw.PreferencesGroup:

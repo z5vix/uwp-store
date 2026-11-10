@@ -31,6 +31,7 @@ class Job:
     logo_url: str
     is_game: bool
     runtime_id: str = ""
+    account_id: str = ""          # the signed-in account whose licence the download uses (the owner)
     state: str = "queued"         # queued, resolving, downloading, installing, done, failed, cancelled
     stage: str = ""
     done: int = 0
@@ -141,12 +142,13 @@ class Installer:
                 return job
         return None
 
-    def enqueue(self, product_id: str, title: str, logo_url: str, is_game: bool, runtime_id: str = "") -> Job:
+    def enqueue(self, product_id: str, title: str, logo_url: str, is_game: bool, runtime_id: str = "",
+                account_id: str = "") -> Job:
         """Queue an install; runtime_id picks the runtime (an update goes where the app already is)."""
         existing = self.active_for(product_id)
         if existing:
             return existing
-        job = Job(product_id, title, logo_url, is_game, runtime_id)
+        job = Job(product_id, title, logo_url, is_game, runtime_id, account_id)
         self.jobs.append(job)
         self._queue.put(job)
         self._emit(job)
@@ -226,7 +228,7 @@ class Installer:
             raise InstallError(f"{runtime.name} is not set up yet: finish setup in Settings (Windows 11 ISO and prefix).")
 
         self._step(job, "resolving", "Finding packages")
-        client = fe3.DeliveryClient(account.store_ticket())
+        client = fe3.DeliveryClient(account.store_ticket(job.account_id or None))
         resolution = client.resolve(product.category_id)
         family = next((s.family_name for s in product.skus if s.family_name), product.family_names[0] if product.family_names else "")
         main = choose_main_package(resolution, family)

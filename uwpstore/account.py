@@ -1,12 +1,17 @@
-"""Microsoft account sign-in: the OAuth device-code flow, as Wine-UWP's winexboxauth does it.
+"""Microsoft accounts: device-code sign-in (as Wine-UWP's winexboxauth does it), several accounts at once.
 
-The store never sees the password. It asks login.live.com for a short code, opens
+The store never sees a password. It asks login.live.com for a short code, opens
 https://www.microsoft.com/link?otc=CODE in the user's own browser, and polls until the user approves.
-What it keeps is the refresh token, in the desktop keyring (libsecret) when there is one, otherwise in
-the settings file (mode 0600). Access tokens for each service scope are minted from it on demand and
-kept in memory only.
+What it keeps for each account is the refresh token, in the desktop keyring (libsecret) when there is one,
+otherwise in the settings file (mode 0600). Access tokens for each service scope are minted from it on
+demand and kept in memory only.
 
-Xbox Live (user.auth -> XSTS) supplies the gamertag shown in the header.
+Several accounts can be signed in at once (yours, a family member's): a product counts as owned when any of
+them owns it, and an install uses the owning account's ticket. One account is "active": the header shows it,
+and it is the default for everything that needs a single account.
+
+Each account is known by its Xbox user id (xuid), from Xbox Live (user.auth -> XSTS), which also gives the
+gamertag.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import json
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 from . import net, settings
@@ -24,14 +29,17 @@ from . import net, settings
 CLIENT_ID = "000000004C12AE6F"                       # the Xbox app's MSA client, as Wine-UWP uses
 SIGNIN_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
 FE3_SCOPE = "service::dcat.update.microsoft.com::MBI_SSL"   # Windows Update / Store delivery tickets
+COLLECTIONS_SCOPE = "service::collections.mp.microsoft.com::MBI_SSL"
 CONNECT_URL = "https://login.live.com/oauth20_connect.srf"
 TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+COLLECTIONS_URL = "https://collections.mp.microsoft.com/v7.0/collections/query"
 LINK_URL = "https://www.microsoft.com/link?otc={code}"
 
-_SECRET_LABEL = "UWP Store: Microsoft account"
+_SCHEMA = "io.github.uwpstore.Store.Accounts"       # one keyring item per account (attribute "account")
+_LEGACY_SCHEMA = "io.github.uwpstore.Store.Account"  # the single-account item of earlier versions
 _lock = threading.RLock()
-_access: dict[str, tuple[str, float]] = {}            # scope -> (token, expiry)
-_profile: "Profile | None" = None
+_access: dict[tuple[str, str], tuple[str, float]] = {}   # (account id, scope) -> (token, expiry)
+_owned: dict[tuple[str, str], tuple[bool, float]] = {}   # (account id, product id) -> (owned, expiry)
 
 
 class AccountError(Exception):
@@ -51,7 +59,12 @@ class DeviceCode:
 class Profile:
     gamertag: str
     xuid: str
-    user_hash: str
+    user_hash: str = ""
+    id: str = ""                                      # the account's key: its xuid (or MSA user id without Xbox)
+
+    @property
+    def name(self) -> str:
+        return self.gamertag or self.xuid or "Microsoft account"
 
 
 # ---- refresh-token storage --------------------------------------------------------------------------
@@ -61,39 +74,131 @@ def _secret():
         import gi
         gi.require_version("Secret", "1")
         from gi.repository import Secret
-        schema = Secret.Schema.new("io.github.uwpstore.Store.Account", Secret.SchemaFlags.NONE,
-                                   {"kind": Secret.SchemaAttributeType.STRING})
-        return Secret, schema
+        return Secret
     except (ImportError, ValueError):
-        return None, None
+        return None
 
 
-def _load_refresh() -> str:
-    Secret, schema = _secret()
+def _schema(Secret, name: str, attribute: str):
+    return Secret.Schema.new(name, Secret.SchemaFlags.NONE, {attribute: Secret.SchemaAttributeType.STRING})
+
+
+def _load_refresh(account_id: str) -> str:
+    Secret = _secret()
     if Secret:
         try:
-            value = Secret.password_lookup_sync(schema, {"kind": "msa-refresh"}, None)
+            value = Secret.password_lookup_sync(_schema(Secret, _SCHEMA, "account"), {"account": account_id}, None)
             if value:
                 return value
         except Exception:  # no keyring daemon: fall back to the settings file
             pass
-    return settings.load().get("msa_refresh_token") or ""
+    return (settings.load().get("msa_refresh_tokens") or {}).get(account_id, "")
 
 
-def _store_refresh(token: str) -> None:
-    Secret, schema = _secret()
+def _store_refresh(account_id: str, token: str) -> None:
+    fallback = dict(settings.load().get("msa_refresh_tokens") or {})
+    Secret = _secret()
     if Secret:
         try:
+            schema = _schema(Secret, _SCHEMA, "account")
             if token:
-                Secret.password_store_sync(schema, {"kind": "msa-refresh"}, Secret.COLLECTION_DEFAULT,
-                                           _SECRET_LABEL, token, None)
+                Secret.password_store_sync(schema, {"account": account_id}, Secret.COLLECTION_DEFAULT,
+                                           f"UWP Store: Microsoft account {account_id}", token, None)
             else:
-                Secret.password_clear_sync(schema, {"kind": "msa-refresh"}, None)
-            settings.save(msa_refresh_token="")      # never keep a second copy on disk
+                Secret.password_clear_sync(schema, {"account": account_id}, None)
+            if account_id in fallback:              # never keep a second copy on disk
+                fallback.pop(account_id)
+                settings.save(msa_refresh_tokens=fallback)
             return
         except Exception:
             pass
-    settings.save(msa_refresh_token=token)
+    if token:
+        fallback[account_id] = token
+    else:
+        fallback.pop(account_id, None)
+    settings.save(msa_refresh_tokens=fallback)
+
+
+def _migrate_single_account() -> None:
+    """Earlier versions kept one account (keyring item without an account id, or msa_refresh_token)."""
+    cfg = settings.load()
+    if cfg.get("msa_accounts"):
+        return
+    legacy, Secret = "", _secret()
+    if Secret:
+        try:
+            legacy = Secret.password_lookup_sync(_schema(Secret, _LEGACY_SCHEMA, "kind"), {"kind": "msa-refresh"}, None) or ""
+        except Exception:
+            legacy = ""
+    legacy = legacy or cfg.get("msa_refresh_token") or ""
+    if not legacy:
+        return
+    old = cfg.get("msa_profile") or {}
+    account_id = old.get("xuid") or "account-1"
+    _store_refresh(account_id, legacy)
+    profile = Profile(old.get("gamertag", ""), old.get("xuid", ""), old.get("user_hash", ""), account_id)
+    settings.save(msa_accounts=[asdict(profile)], msa_active=account_id, msa_refresh_token="", msa_profile={})
+    if Secret:
+        try:
+            Secret.password_clear_sync(_schema(Secret, _LEGACY_SCHEMA, "kind"), {"kind": "msa-refresh"}, None)
+        except Exception:
+            pass
+
+
+# ---- the account list ---------------------------------------------------------------------------------
+
+def accounts() -> list[Profile]:
+    with _lock:
+        _migrate_single_account()
+        return [Profile(**{k: v for k, v in raw.items() if k in Profile.__dataclass_fields__})
+                for raw in settings.load().get("msa_accounts") or []]
+
+
+def get(account_id: str) -> Profile | None:
+    return next((a for a in accounts() if a.id == account_id), None)
+
+
+def active() -> Profile | None:
+    found = accounts()
+    wanted = settings.load().get("msa_active")
+    return next((a for a in found if a.id == wanted), found[0] if found else None)
+
+
+def set_active(account_id: str) -> None:
+    if get(account_id):
+        settings.save(msa_active=account_id)
+
+
+def signed_in() -> bool:
+    return bool(accounts())
+
+
+def _save_account(profile: Profile) -> None:
+    with _lock:
+        found = [a for a in accounts() if a.id != profile.id]
+        found.append(profile)
+        changes: dict = {"msa_accounts": [asdict(a) for a in found]}
+        if not settings.load().get("msa_active") or len(found) == 1:
+            changes["msa_active"] = profile.id
+        settings.save(**changes)
+
+
+def sign_out(account_id: str | None = None) -> None:
+    """Forget one account (the active one by default); the others stay signed in."""
+    with _lock:
+        target = account_id or (active().id if active() else "")
+        if not target:
+            return
+        _store_refresh(target, "")
+        for key in [k for k in _access if k[0] == target]:
+            _access.pop(key)
+        for key in [k for k in _owned if k[0] == target]:
+            _owned.pop(key)
+        rest = [a for a in accounts() if a.id != target]
+        changes: dict = {"msa_accounts": [asdict(a) for a in rest]}
+        if settings.load().get("msa_active") == target:
+            changes["msa_active"] = rest[0].id if rest else ""
+        settings.save(**changes)
 
 
 # ---- OAuth -------------------------------------------------------------------------------------------
@@ -116,7 +221,7 @@ def start_device_code() -> DeviceCode:
 
 
 def poll_device_code(code: DeviceCode, cancelled: Callable[[], bool] = lambda: False) -> Profile:
-    """Wait until the user approves the code in their browser, then sign in to Xbox Live."""
+    """Wait until the user approves the code in their browser; adds that account (or refreshes it if known)."""
     interval = code.interval
     while time.time() < code.expires_at:
         for _ in range(interval * 10):
@@ -129,12 +234,15 @@ def poll_device_code(code: DeviceCode, cancelled: Callable[[], bool] = lambda: F
         except net.NetError:
             continue                                   # transient; keep polling
         if status == 200 and data.get("access_token"):
+            profile = _xbox_profile(data["access_token"])
+            profile.id = profile.xuid or data.get("user_id") or f"account-{int(time.time())}"
             with _lock:
-                _access.clear()
-                _access[SIGNIN_SCOPE] = (data["access_token"], time.time() + float(data.get("expires_in") or 3600))
                 if data.get("refresh_token"):
-                    _store_refresh(data["refresh_token"])
-            return profile(refresh=True)
+                    _store_refresh(profile.id, data["refresh_token"])
+                _access[(profile.id, SIGNIN_SCOPE)] = (data["access_token"],
+                                                       time.time() + float(data.get("expires_in") or 3600))
+                _save_account(profile)
+            return profile
         error = data.get("error", "")
         if error == "authorization_pending":
             continue
@@ -147,68 +255,63 @@ def poll_device_code(code: DeviceCode, cancelled: Callable[[], bool] = lambda: F
     raise AccountError("The code expired before the sign-in was finished. Try again.")
 
 
-def signed_in() -> bool:
-    return bool(_load_refresh())
+def _token_grant(account_id: str, scope: str) -> dict:
+    refresh = _load_refresh(account_id)
+    if not refresh:
+        raise AccountError("Not signed in")
+    status, data = _form(TOKEN_URL, {"grant_type": "refresh_token", "client_id": CLIENT_ID,
+                                     "scope": scope, "refresh_token": refresh})
+    if status != 200 or not data.get("access_token"):
+        error = data.get("error", "")
+        if error in ("invalid_grant", "interaction_required"):
+            who = get(account_id)
+            raise AccountError(f"The sign-in for {who.name if who else 'this account'} has expired. Sign in again.")
+        raise AccountError(data.get("error_description") or error or f"HTTP {status}")
+    if data.get("refresh_token") and data["refresh_token"] != refresh:
+        _store_refresh(account_id, data["refresh_token"])
+    return data
 
 
-def access_token(scope: str = SIGNIN_SCOPE) -> str:
-    """An access token (an RPS ticket) for a service scope, minted from the refresh token."""
+def access_token(scope: str = SIGNIN_SCOPE, account_id: str | None = None) -> str:
+    """An access token (an RPS ticket) for a service scope, minted from the account's refresh token."""
     with _lock:
-        cached = _access.get(scope)
+        account_id = account_id or (active().id if active() else "")
+        if not account_id:
+            raise AccountError("Not signed in")
+        cached = _access.get((account_id, scope))
         if cached and cached[1] > time.time() + 120:
             return cached[0]
-        refresh = _load_refresh()
-        if not refresh:
-            raise AccountError("Not signed in")
-        status, data = _form(TOKEN_URL, {"grant_type": "refresh_token", "client_id": CLIENT_ID,
-                                         "scope": scope, "refresh_token": refresh})
-        if status != 200 or not data.get("access_token"):
-            error = data.get("error", "")
-            if error in ("invalid_grant", "interaction_required"):
-                raise AccountError("Your Microsoft account sign-in has expired. Sign in again.")
-            raise AccountError(data.get("error_description") or error or f"HTTP {status}")
-        if data.get("refresh_token") and data["refresh_token"] != refresh:
-            _store_refresh(data["refresh_token"])
-        _access[scope] = (data["access_token"], time.time() + float(data.get("expires_in") or 3600))
+        data = _token_grant(account_id, scope)
+        _access[(account_id, scope)] = (data["access_token"], time.time() + float(data.get("expires_in") or 3600))
         return data["access_token"]
 
 
-def store_ticket() -> str | None:
+def store_ticket(account_id: str | None = None) -> str | None:
     """The MSA ticket for the Store's package delivery (FE3), or None when signed out or refused."""
     if not signed_in():
         return None
     try:
         # FE3 takes the RPS ticket as base64("t=" + token); the bare token fails its security check
-        return base64.b64encode(("t=" + access_token(FE3_SCOPE)).encode()).decode()
+        return base64.b64encode(("t=" + access_token(FE3_SCOPE, account_id)).encode()).decode()
     except (AccountError, net.NetError):
         return None
 
 
-# ---- what the account owns -------------------------------------------------------------------------
+# ---- what the accounts own ----------------------------------------------------------------------------
 
-COLLECTIONS_SCOPE = "service::collections.mp.microsoft.com::MBI_SSL"
-COLLECTIONS_URL = "https://collections.mp.microsoft.com/v7.0/collections/query"
-_owned: dict[str, tuple[bool, float]] = {}
-
-
-def owns(product_id: str) -> bool:
-    """Does the signed-in account own the product (purchase, free claim or bundle)? As Wine-UWP's winexboxauth asks:
+def owns(product_id: str, account_id: str | None = None) -> bool:
+    """Does this account own the product (purchase, free claim or bundle)? As Wine-UWP's winexboxauth asks:
     collections.mp.microsoft.com with the account as beneficiary. Subscription access (Game Pass) is not ownership."""
-    if not signed_in():
+    account_id = account_id or (active().id if active() else "")
+    if not account_id:
         return False
     product_id = product_id.upper()
     with _lock:
-        cached = _owned.get(product_id)
+        cached = _owned.get((account_id, product_id))
         if cached and cached[1] > time.time():
             return cached[0]
-        refresh = _load_refresh()
-        status, data = _form(TOKEN_URL, {"grant_type": "refresh_token", "client_id": CLIENT_ID,
-                                         "scope": COLLECTIONS_SCOPE, "refresh_token": refresh})
-        if status != 200 or not data.get("access_token"):
-            raise AccountError(data.get("error_description") or "Could not check your licences")
-        if data.get("refresh_token") and data["refresh_token"] != refresh:
-            _store_refresh(data["refresh_token"])
-        ticket, puid = data["access_token"], data.get("user_id", "")
+        data = _token_grant(account_id, COLLECTIONS_SCOPE)
+    ticket, puid = data["access_token"], data.get("user_id", "")
     body = {"beneficiaries": [{"identityType": "msa", "identityValue": ticket, "localTicketReference": puid}],
             "maxPageSize": 25, "market": settings.load().get("market") or "US",
             "productSkuIds": [{"productId": product_id}], "validityType": "Valid"}
@@ -218,8 +321,25 @@ def owns(product_id: str) -> bool:
         raise AccountError(f"The licence service answered HTTP {status}")
     owned = bool(json.loads(raw or b"{}").get("items"))
     with _lock:
-        _owned[product_id] = (owned, time.time() + 600)
+        _owned[(account_id, product_id)] = (owned, time.time() + 600)
     return owned
+
+
+def owners(product_id: str) -> list[Profile]:
+    """Every signed-in account that owns the product, the active account first."""
+    found = accounts()
+    current = active()
+    found.sort(key=lambda a: a.id != (current.id if current else ""))
+    out, errors = [], []
+    for profile in found:
+        try:
+            if owns(product_id, profile.id):
+                out.append(profile)
+        except (AccountError, net.NetError) as exc:
+            errors.append(exc)
+    if not out and errors and len(errors) == len(found):
+        raise AccountError(str(errors[0]))
+    return out
 
 
 # ---- Xbox Live profile -------------------------------------------------------------------------------
@@ -233,17 +353,7 @@ def _xbl_post(url: str, body: dict) -> dict:
     return json.loads(data)
 
 
-def profile(refresh: bool = False) -> Profile:
-    """The signed-in account's gamertag, via user.auth.xboxlive.com and xsts.auth.xboxlive.com."""
-    global _profile
-    with _lock:
-        if _profile and not refresh:
-            return _profile
-        cached = settings.load().get("msa_profile") or {}
-        if cached and not refresh:
-            _profile = Profile(**cached)
-            return _profile
-    rps = access_token(SIGNIN_SCOPE)
+def _xbox_profile(rps: str) -> Profile:
     user = _xbl_post("https://user.auth.xboxlive.com/user/authenticate", {
         "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT",
         "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": f"t={rps}"}})
@@ -251,29 +361,25 @@ def profile(refresh: bool = False) -> Profile:
         "RelyingParty": "http://xboxlive.com", "TokenType": "JWT",
         "Properties": {"SandboxId": "RETAIL", "UserTokens": [user["Token"]]}})
     claims = (xsts.get("DisplayClaims", {}).get("xui") or [{}])[0]
-    result = Profile(claims.get("gtg", ""), claims.get("xid", ""), claims.get("uhs", ""))
-    with _lock:
-        _profile = result
-    settings.save(msa_profile=result.__dict__)       # gamertag only; no tokens
-    return result
+    return Profile(claims.get("gtg", ""), claims.get("xid", ""), claims.get("uhs", ""))
+
+
+def profile(refresh: bool = False, account_id: str | None = None) -> Profile:
+    """An account's gamertag (the active account by default); refresh asks Xbox Live again."""
+    current = get(account_id) if account_id else active()
+    if current is None:
+        raise AccountError("Not signed in")
+    if current.gamertag and not refresh:
+        return current
+    fresh = _xbox_profile(access_token(SIGNIN_SCOPE, current.id))
+    fresh.id = current.id
+    _save_account(fresh)
+    return fresh
 
 
 def cached_profile() -> Profile | None:
-    """The last known profile without touching the network (for drawing the header)."""
-    if not signed_in():
-        return None
-    data = settings.load().get("msa_profile") or {}
-    return Profile(**data) if data else _profile
-
-
-def sign_out() -> None:
-    global _profile
-    with _lock:
-        _access.clear()
-        _owned.clear()
-        _profile = None
-        _store_refresh("")
-    settings.save(msa_profile={})
+    """The active account without touching the network (for drawing the header)."""
+    return active()
 
 
 def _jwt_claims(token: str) -> dict:  # debugging helper
