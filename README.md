@@ -124,7 +124,10 @@ download link, and a shortcut that copies the product link and opens rg-adguard 
 
 UWP apps need Microsoft's own frameworks (XAML, the app model, CoreMessaging). They are **not shipped**: Settings →
 Setup asks for a Windows 11 ISO you already have (or links Microsoft's free evaluation ISO), and wine-uwp's
-harvester extracts the needed files from it on your machine. The harvested tree is shared by every runtime. If v1
+harvester extracts the needed files from it on your machine. The harvested tree is shared by every runtime.
+The same ISO also supplies Microsoft's **WebView2 runtime** (`Program Files (x86)/Microsoft/EdgeWebView` from its
+`install.wim`, extracted with 7-Zip into `~/.local/share/uwp-store/webview2`). The Xbox app draws parts of its UI
+with it and crashes without it. Each runtime installs it into its prefix on the next launch. If v1
 already harvested one (`~/.local/share/ms-store-uwp/data*/windows`), v2 uses it.
 
 ## How it works
@@ -162,6 +165,9 @@ plain wine-uwp runtime (both are selectable in Settings).
 ## Limits
 
 - Buying happens on Microsoft's site: paid products you do not own link to their web page.
+- The Xbox app is a moving target: Wine-UWP documents it working at 2608.1001.17. Version 2612.1001.23 crashes
+  under the Wine-UWP 11.20 build of 2026-10-27 (a NULL read in `XboxPcApp.exe`, after a failed activation of its own
+  `XboxPcAppFT` COM server), WebView2 or not.
 - Whether an owned game *runs* depends on Wine-UWP answering its licence check at run time; installing it is not proof. Nothing bypasses licensing, and encrypted packages (`.eappx`, `.emsix`) are refused.
 - Xbox PC games shipped as MSIXVC install only through the Xbox app (see *Games you own*).
 - Apps built on frameworks the Windows image and the Store do not provide (Windows 8.1 JavaScript apps that need WinJS) cannot install; the store says which framework is missing.

@@ -159,6 +159,13 @@ class Runtime:
         env = dict(os.environ)
         env["WINE_UWP_DATA"] = str(self.profile)
         env["WINEPREFIX"] = str(self.prefix)
+        from . import webview2
+        if webview2.available() and not (self.profile / "webview2" / "rt").is_dir():
+            # the runtime installs it into the prefix on the next run (install-overrides.sh honours this); its setup
+            # skips work when its stamp is current, so force one pass while the prefix still lacks the runtime
+            env.setdefault("WEBVIEW2_RUNTIME", str(webview2.root()))
+            if not (self.prefix / "drive_c" / "Program Files (x86)" / "Microsoft" / "EdgeWebView").is_dir():
+                env.setdefault("WINE_UWP_FORCE_OVERRIDES", "1")
         if self.d3d_runtime:
             env["WINE_UWP_D3D_RUNTIME"] = str(self.d3d_runtime)
         if self.is_proton:

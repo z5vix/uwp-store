@@ -9,7 +9,7 @@ from typing import Callable, Iterator
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-from .. import account, catalog, desktop, installer, net, xboxaccounts, packages, paths, runtimes, settings
+from .. import account, catalog, desktop, installer, net, webview2, xboxaccounts, packages, paths, runtimes, settings
 from . import account as ui_account
 from .util import human_size, run_async
 
@@ -150,6 +150,14 @@ class SettingsDialog(Adw.PreferencesDialog):
         harvest.connect("clicked", lambda *_: self._harvest())
         iso_row.add_suffix(harvest)
         windows.add(iso_row)
+        wv2 = Adw.ActionRow(title="WebView2 runtime",
+                            subtitle=(f"{webview2.version()} (from your ISO; the Xbox app needs it)" if webview2.available()
+                                      else "Not extracted: the Xbox app crashes without it"))
+        if not webview2.available():
+            extract = Gtk.Button(label="Extract from ISO", valign=Gtk.Align.CENTER)
+            extract.connect("clicked", lambda *_: self._extract_webview2())
+            wv2.add_suffix(extract)
+        windows.add(wv2)
         link = Adw.ActionRow(title="No ISO?", subtitle="Microsoft offers a free Windows 11 Enterprise evaluation ISO",
                              activatable=True)
         link.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
@@ -409,7 +417,19 @@ class SettingsDialog(Adw.PreferencesDialog):
         if runtime is None or not iso.is_file():
             self.toast("Choose an ISO and have a runtime first")
             return
-        TaskDialog("Harvesting Windows components", lambda c: runtime.harvest(iso, c),
+        def steps(cancelled):
+            yield from runtime.harvest(iso, cancelled)
+            if not webview2.available():
+                yield from webview2.extract(iso, cancelled)
+        TaskDialog("Harvesting Windows components", steps,
+                   lambda ok: (self._build(), self.changed())).present(self)
+
+    def _extract_webview2(self) -> None:
+        iso = Path(settings.load()["iso_path"])
+        if not iso.is_file():
+            self.toast("Choose your Windows 11 ISO first")
+            return
+        TaskDialog("Extracting WebView2 from your ISO", lambda c: webview2.extract(iso, c),
                    lambda ok: (self._build(), self.changed())).present(self)
 
     def _new_prefix(self, runtime: runtimes.Runtime) -> None:
