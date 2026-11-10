@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: z5vix <z5vix@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:30:00 -0500
+Subject: [PATCH] UWP Store: UWP Minecraft: window reuse, DeviceInformation FindAllAsync with kind, Media Foundation delay-load exports, Store product queries
+
+Applies after 92-uwpstore-xbox-app-identity.patch. Found bringing UWP Minecraft (Microsoft.MinecraftUWP) from a crash on its first frame to its welcome screen:
+- wineuwp: the window factory allows window reuse. Answering FALSE made twinapi.appcore create a second view
+  for the launch activation, calling the app's IFrameworkViewSource::CreateView a second time. Minecraft moves
+  its game factory into the first view it creates, so the view it was activated in had none and faulted on a
+  NULL in its first tick. WINE_UWP_NO_WINDOW_REUSE gives the old answer. The Xbox app still reaches its main
+  screen with reuse allowed.
+- windows.devices.enumeration: IDeviceInformationStatics2::FindAllAsync (filter, properties, kind), sharing
+  the Statics FindAllAsync path; kind picks the DevQuery object type as CreateFromIdAsync does. Its E_NOTIMPL
+  became a winrt::hresult_not_implemented in Minecraft's start-up.
+- mfplat: exports Windows.Media.dll, Windows.Media.Audio.dll and Windows.Media.Editing.dll delay-load
+  (MFCreatePropertiesFromMediaType, MFCreateMediaTypeFromProperties, MFCreateTelemetrySession, ...), answering
+  E_NOTIMPL. A missing export ended the process through the delay-load failure hook; a failed call is reported
+  to the caller instead.
+- windows.services.store: GetStoreProductsAsync and GetAssociatedStoreProductsAsync answer a completed query
+  with no products (an empty, iterable IMapView<String, StoreProduct>; AddOnLicenses becomes iterable too).
+  Minecraft asks for its add-on catalogue at start-up, and the E_NOTIMPL ended it as an unobserved task
+  exception.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/wineuwp/main.c
++++ b/dlls/wineuwp/main.c
+@@ -4693,11 +4693,16 @@
+     return hr;
+ }
+ 
++/* Whether the activation may land in the view the app already has. On Windows a launch of an app that is starting
++ * up goes to its main view; answering FALSE made twinapi.appcore create a second view, calling the app's
++ * IFrameworkViewSource::CreateView again. Minecraft (UWP) hands its game factory to the first view it creates, so
++ * the second view it was activated in had none and faulted on its first frame. WINE_UWP_NO_WINDOW_REUSE restores
++ * the old answer. */
+ static HRESULT WINAPI wf_get_WindowReuseAllowed( struct window_factory *wf, boolean *value )
+ {
+     TRACE( "%p\n", value );
+     if (!value) return E_POINTER;
+-    *value = FALSE;
++    *value = !GetEnvironmentVariableW( L"WINE_UWP_NO_WINDOW_REUSE", NULL, 0 );
+     return S_OK;
+ }
+ 
+--- a/dlls/windows.devices.enumeration/main.c
++++ b/dlls/windows.devices.enumeration/main.c
+@@ -942,10 +942,20 @@
+     return IDeviceInformationStatics_FindAllAsyncAqsFilterAndAdditionalProperties( iface, filter, NULL, op );
+ }
+ 
+-static HRESULT WINAPI device_statics_FindAllAsyncAqsFilterAndAdditionalProperties( IDeviceInformationStatics *iface, HSTRING filter,
+-                                                                                   IIterable_HSTRING *additional_properties,
+-                                                                                   IAsyncOperation_DeviceInformationCollection **op )
++static HRESULT find_all( IUnknown *invoker, HSTRING filter, IIterable_HSTRING *additional_properties,
++                         DeviceInformationKind kind, IAsyncOperation_DeviceInformationCollection **op )
+ {
++    static const DEV_OBJECT_TYPE kind_type[] = {
++        DevObjectTypeDeviceInterfaceDisplay, /* Unknown: interfaces, as IDeviceInformationStatics finds */
++        DevObjectTypeDeviceInterfaceDisplay,
++        DevObjectTypeDeviceContainerDisplay,
++        DevObjectTypeDevice,
++        DevObjectTypeDeviceInterfaceClass,
++        DevObjectTypeAEP,
++        DevObjectTypeAEPContainer,
++        DevObjectTypeAEPService,
++        DevObjectTypeDevicePanel,
++    };
+     const DEVPROPCOMPKEY device_iface_default_props[] = {
+         { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL },
+         { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
+@@ -956,14 +966,14 @@
+     IUnknown *params;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, aqs %s, additional_properties %p, op %p\n", iface, debugstr_hstring(filter), additional_properties, op );
+-
+-    if (FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) ))) goto failed;
++    if (kind >= ARRAY_SIZE( kind_type )) return E_INVALIDARG;
++    if (kind <= DeviceInformationKind_DeviceInterface &&
++        FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_iface_default_props, ARRAY_SIZE( device_iface_default_props ) ))) goto failed;
+     if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties ))) goto failed;
+     if (FAILED(hr = aqs_parse_query(WindowsGetStringRawBuffer( filter, NULL ), &expr, NULL ))) goto failed;
+-    if (FAILED(hr = devquery_params_create( DevObjectTypeDeviceInterfaceDisplay, expr, prop_keys, prop_keys_len, &params ))) goto failed;
++    if (FAILED(hr = devquery_params_create( kind_type[kind], expr, prop_keys, prop_keys_len, &params ))) goto failed;
+ 
+-    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, (IUnknown *)iface, params, find_all_async,
++    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, invoker, params, find_all_async,
+                                              (IAsyncOperation_IInspectable **)op );
+     IUnknown_Release( params );
+     return hr;
+@@ -974,6 +984,14 @@
+     return hr;
+ }
+ 
++static HRESULT WINAPI device_statics_FindAllAsyncAqsFilterAndAdditionalProperties( IDeviceInformationStatics *iface, HSTRING filter,
++                                                                                   IIterable_HSTRING *additional_properties,
++                                                                                   IAsyncOperation_DeviceInformationCollection **op )
++{
++    TRACE( "iface %p, aqs %s, additional_properties %p, op %p\n", iface, debugstr_hstring(filter), additional_properties, op );
++    return find_all( (IUnknown *)iface, filter, additional_properties, DeviceInformationKind_DeviceInterface, op );
++}
++
+ static HRESULT WINAPI device_statics_CreateWatcher( IDeviceInformationStatics *iface, IDeviceWatcher **watcher )
+ {
+     TRACE( "iface %p, watcher %p\n", iface, watcher );
+@@ -1050,9 +1068,9 @@
+                                                     IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
+                                                     IAsyncOperation_DeviceInformationCollection **async_operation )
+ {
+-    FIXME( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p stub!\n",
+-            iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p\n",
++           iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
++    return find_all( (IUnknown *)iface, filter, additional_properties, kind, async_operation );
+ }
+ 
+ static const char *debugstr_DeviceInformationKind( DeviceInformationKind kind )
+--- a/dlls/mfplat/mfplat.spec
++++ b/dlls/mfplat/mfplat.spec
+@@ -73,6 +73,7 @@
+ @ stdcall MFCreateSystemTimeSource(ptr)
+ @ stub MFCreateSystemUnderlyingClock
+ @ stdcall MFCreateTempFile(long long long ptr)
++@ stdcall MFCreateTelemetrySession(ptr)
+ @ stdcall MFCreateTrackedSample(ptr)
+ @ stdcall MFCreateTransformActivate(ptr)
+ @ stub MFCreateURLFromPath
+@@ -183,3 +184,11 @@
+ @ stdcall -ret64 MFllMulDiv(int64 int64 int64 int64)
+ @ stub PropVariantFromStream
+ @ stub PropVariantToStream
++@ stdcall MFGetContentProtectionSystemCLSID(ptr ptr)
++@ stdcall MFCreateStreamOnMFByteStream(ptr ptr)
++@ stdcall MFCreateStreamOnMFByteStreamEx(ptr ptr ptr)
++@ stdcall MFCreateMediaTypeFromProperties(ptr ptr)
++@ stdcall MFIsContentProtectionDeviceSupported(ptr ptr)
++@ stdcall MFCreateWICBitmapBuffer(ptr ptr ptr)
++@ stdcall MFCreateMediaExtensionActivate(wstr ptr ptr ptr)
++@ stdcall MFCreatePropertiesFromMediaType(ptr ptr ptr)
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -4679,6 +4679,19 @@
+ }
+ 
+ /***********************************************************************
++ *      MFCreateTelemetrySession (mfplat.@)
++ */
++HRESULT WINAPI MFCreateTelemetrySession(IUnknown **session)
++{
++    FIXME("%p stub!\n", session);
++
++    if (!session)
++        return E_POINTER;
++    *session = NULL;
++    return E_NOTIMPL;
++}
++
++/***********************************************************************
+  *      MFCreateTempFile (mfplat.@)
+  */
+ HRESULT WINAPI MFCreateTempFile(MF_FILE_ACCESSMODE accessmode, MF_FILE_OPENMODE openmode, MF_FILE_FLAGS flags,
+@@ -9988,3 +10001,71 @@
+     FIXME("%p %lx %p: stub!\n", attr, options, stream);
+     return E_NOTIMPL;
+ }
++
++/***********************************************************************
++ *      Media Foundation entry points that Windows.Media and its siblings delay-load. They are
++ *      only reached through features Wine does not provide yet; answering E_NOTIMPL lets the
++ *      caller report the failure instead of the delay-load hook ending the process.
++ */
++HRESULT WINAPI MFGetContentProtectionSystemCLSID(REFGUID system_id, CLSID *clsid)
++{
++    FIXME("%s, %p stub!\n", debugstr_guid(system_id), clsid);
++    if (clsid) memset(clsid, 0, sizeof(*clsid));
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFIsContentProtectionDeviceSupported(REFGUID system_id, BOOL *supported)
++{
++    FIXME("%s, %p stub!\n", debugstr_guid(system_id), supported);
++    if (!supported) return E_POINTER;
++    *supported = FALSE;
++    return S_OK;
++}
++
++HRESULT WINAPI MFCreateStreamOnMFByteStream(IMFByteStream *bytestream, IStream **stream)
++{
++    FIXME("%p, %p stub!\n", bytestream, stream);
++    if (!stream) return E_POINTER;
++    *stream = NULL;
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFCreateStreamOnMFByteStreamEx(IMFByteStream *bytestream, REFIID riid, void **out)
++{
++    FIXME("%p, %s, %p stub!\n", bytestream, debugstr_guid(riid), out);
++    if (!out) return E_POINTER;
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFCreateMediaTypeFromProperties(IUnknown *properties, IMFMediaType **media_type)
++{
++    FIXME("%p, %p stub!\n", properties, media_type);
++    if (!media_type) return E_POINTER;
++    *media_type = NULL;
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFCreatePropertiesFromMediaType(IMFMediaType *media_type, REFIID riid, void **out)
++{
++    FIXME("%p, %s, %p stub!\n", media_type, debugstr_guid(riid), out);
++    if (!out) return E_POINTER;
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFCreateWICBitmapBuffer(REFIID riid, IUnknown *surface, IMFMediaBuffer **buffer)
++{
++    FIXME("%s, %p, %p stub!\n", debugstr_guid(riid), surface, buffer);
++    if (!buffer) return E_POINTER;
++    *buffer = NULL;
++    return E_NOTIMPL;
++}
++
++HRESULT WINAPI MFCreateMediaExtensionActivate(const WCHAR *activatable_class, IUnknown *configuration, REFIID riid, void **out)
++{
++    FIXME("%s, %p, %s, %p stub!\n", debugstr_w(activatable_class), configuration, debugstr_guid(riid), out);
++    if (!out) return E_POINTER;
++    *out = NULL;
++    return E_NOTIMPL;
++}
+--- a/dlls/windows.services.store/main.c
++++ b/dlls/windows.services.store/main.c
+@@ -31,6 +31,10 @@
+  * GetAppLicenseAsync is answered: Gears of War 4 asks for its licence at start-up, and an E_NOTIMPL there became an
+  * unobserved task exception that ended the game. The licence is the one this prefix has (the user owns what the Xbox
+  * app installed): active, not a trial, with no add-ons. The operation is already complete when handed out.
++ *
++ * GetStoreProductsAsync and GetAssociatedStoreProductsAsync are answered the same way, with an empty product list:
++ * Minecraft asks for its add-on catalogue at start-up and ended on the E_NOTIMPL as Gears of War 4 did. The Store's
++ * catalogue is not reachable from here, so the honest answer is a successful query that found nothing.
+  */
+ 
+ #include <stdarg.h>
+@@ -54,6 +58,15 @@
+ /* IAsyncOperation<StoreAppLicense>, IMapView<String, StoreLicense> (piid.py) */
+ DEFINE_GUID( IID_IAsyncOperation_StoreAppLicense, 0x3866370b, 0xafc6, 0x5d01, 0x84, 0xc2, 0x45, 0x74, 0x62, 0x8d, 0xe5, 0x39 );
+ DEFINE_GUID( IID_IMapView_StoreLicense, 0x7dbaefd8, 0xc83a, 0x5ce3, 0xaf, 0x87, 0xac, 0xde, 0x89, 0x51, 0x97, 0xab );
++/* StoreProductQueryResult, IAsyncOperation<StoreProductQueryResult>, IMapView<String, StoreProduct> (piid.py) */
++DEFINE_GUID( IID_IStoreProductQueryResult, 0xd805e6c5, 0xd456, 0x4ff6, 0x80, 0x49, 0x90, 0x76, 0xd5, 0x16, 0x5f, 0x73 );
++DEFINE_GUID( IID_IAsyncOperation_StoreProductQueryResult, 0x9699e7bb, 0xea1f, 0x5e03, 0x94, 0x39, 0xc8, 0x0e, 0x69, 0x77, 0xb7, 0x11 );
++DEFINE_GUID( IID_IMapView_StoreProduct, 0xdbaac6e5, 0x61a4, 0x5c88, 0xb5, 0xd8, 0x3a, 0x3e, 0x16, 0x1c, 0x3e, 0x4a );
++/* IIterable/IIterator<IKeyValuePair<String, StoreProduct>> and <..., StoreLicense> (piid.py): the maps are iterated */
++DEFINE_GUID( IID_IIterable_KVP_StoreProduct, 0x78a33722, 0xabfb, 0x57c0, 0x85, 0x3f, 0x56, 0x16, 0xa3, 0xab, 0x8d, 0x57 );
++DEFINE_GUID( IID_IIterator_KVP_StoreProduct, 0x0edb142c, 0x9d04, 0x532b, 0x81, 0xe9, 0x4c, 0x84, 0xab, 0x09, 0xb3, 0x4b );
++DEFINE_GUID( IID_IIterable_KVP_StoreLicense, 0xca8ba445, 0x6f4d, 0x5da9, 0x95, 0xee, 0x42, 0xcf, 0x11, 0x8d, 0xef, 0x63 );
++DEFINE_GUID( IID_IIterator_KVP_StoreLicense, 0xa1509348, 0x6522, 0x5062, 0xae, 0x86, 0xcf, 0x59, 0x54, 0x75, 0x92, 0x6d );
+ DEFINE_GUID( IID_IAsyncInfo_, 0x00000036, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 );
+ 
+ static const WCHAR class_name[] = L"Windows.Services.Store.StoreContext";
+@@ -201,6 +214,63 @@
+     return S_OK;
+ }
+ 
++/* the empty maps' iteration: First() hands out an iterator that is already past the end */
++static const void *empty_iterable_vtbl[7], *empty_iterator_vtbl[10];
++static struct object empty_iterable = { empty_iterable_vtbl }, empty_iterator = { empty_iterator_vtbl };
++
++static HRESULT WINAPI empty_iterable_QueryInterface( struct object *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterable_KVP_StoreProduct ) || IsEqualGUID( iid, &IID_IIterable_KVP_StoreLicense ))
++    {
++        *out = &empty_iterable;
++        return S_OK;
++    }
++    FIXME( "empty iterable: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI empty_iterable_First( struct object *iface, struct object **iterator )
++{
++    if (!iterator) return E_POINTER;
++    *iterator = &empty_iterator;
++    return S_OK;
++}
++static HRESULT WINAPI empty_iterator_QueryInterface( struct object *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IIterator_KVP_StoreProduct ) || IsEqualGUID( iid, &IID_IIterator_KVP_StoreLicense ))
++    {
++        *out = &empty_iterator;
++        return S_OK;
++    }
++    FIXME( "empty iterator: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI empty_iterator_get_Current( struct object *iface, IInspectable **value )
++{
++    if (value) *value = NULL;
++    return E_BOUNDS;
++}
++static HRESULT WINAPI empty_iterator_false( struct object *iface, boolean *value )
++{
++    if (!value) return E_POINTER;
++    *value = FALSE;
++    return S_OK;
++}
++static HRESULT WINAPI empty_iterator_GetMany( struct object *iface, UINT32 capacity, IInspectable **items, UINT32 *count )
++{
++    if (!count) return E_POINTER;
++    *count = 0;
++    return S_OK;
++}
++static HRESULT WINAPI empty_GetRuntimeClassName( struct object *iface, HSTRING *name )
++{
++    *name = NULL;
++    return S_OK;
++}
++
+ /* AddOnLicenses: an empty IMapView<String, StoreLicense> */
+ static HRESULT WINAPI addons_QueryInterface( struct object *iface, REFIID iid, void **out )
+ {
+@@ -210,6 +280,11 @@
+         *out = &addons;
+         return S_OK;
+     }
++    if (IsEqualGUID( iid, &IID_IIterable_KVP_StoreLicense ))
++    {
++        *out = &empty_iterable;
++        return S_OK;
++    }
+     FIXME( "AddOnLicenses: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -353,6 +428,156 @@
+     v[9] = license_info_Cancel; v[10] = license_info_Close;
+ }
+ 
++/* ---- product queries: a completed IAsyncOperation<StoreProductQueryResult> with no products ---- */
++
++static const void *query_vtbl[8], *products_vtbl[10], *query_op_vtbl[9], *query_info_vtbl[11];
++static struct object query = { query_vtbl }, products = { products_vtbl };
++static struct object query_op = { query_op_vtbl }, query_info = { query_info_vtbl };
++
++static HRESULT WINAPI query_QueryInterface( struct object *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStoreProductQueryResult ))
++    {
++        *out = &query;
++        return S_OK;
++    }
++    FIXME( "StoreProductQueryResult: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI query_GetRuntimeClassName( struct object *iface, HSTRING *name )
++{
++    static const WCHAR str[] = L"Windows.Services.Store.StoreProductQueryResult";
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++static HRESULT WINAPI query_get_Products( struct object *iface, struct object **value )
++{
++    if (!value) return E_POINTER;
++    *value = &products;
++    return S_OK;
++}
++static HRESULT WINAPI query_get_ExtendedError( struct object *iface, HRESULT *value )
++{
++    if (!value) return E_POINTER;
++    *value = S_OK;
++    return S_OK;
++}
++
++static HRESULT WINAPI products_QueryInterface( struct object *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMapView_StoreProduct ))
++    {
++        *out = &products;
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IIterable_KVP_StoreProduct ))
++    {
++        *out = &empty_iterable;
++        return S_OK;
++    }
++    FIXME( "Products: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static HRESULT WINAPI products_GetRuntimeClassName( struct object *iface, HSTRING *name )
++{
++    static const WCHAR str[] = L"Windows.Foundation.Collections.IMapView`2<String, Windows.Services.Store.StoreProduct>";
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++
++static HRESULT WINAPI query_op_QueryInterface( struct object *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_StoreProductQueryResult ))
++        *out = &query_op;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo_ )) *out = &query_info;
++    else
++    {
++        FIXME( "product query operation: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    return S_OK;
++}
++static HRESULT WINAPI query_op_GetRuntimeClassName( struct object *iface, HSTRING *name )
++{
++    static const WCHAR str[] = L"Windows.Foundation.IAsyncOperation`1<Windows.Services.Store.StoreProductQueryResult>";
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++static HRESULT WINAPI query_op_put_Completed( struct object *iface, IUnknown *handler )
++{
++    HRESULT (WINAPI *invoke)( IUnknown *, struct object *, INT32 );
++
++    if (!handler) return E_POINTER;
++    invoke = (*(void ***)handler)[3];
++    invoke( handler, &query_op, 1 /* Completed */ );
++    return S_OK;
++}
++static HRESULT WINAPI query_op_GetResults( struct object *iface, struct object **result )
++{
++    TRACE( "-> no products.\n" );
++    if (!result) return E_POINTER;
++    *result = &query;
++    return S_OK;
++}
++
++static HRESULT WINAPI context_GetStoreProductsAsync( struct object *iface, IUnknown *kinds, IUnknown *ids,
++                                                     struct object **operation )
++{
++    TRACE( "kinds %p, ids %p, operation %p.\n", kinds, ids, operation );
++    if (!operation) return E_POINTER;
++    *operation = &query_op;
++    return S_OK;
++}
++
++static HRESULT WINAPI context_GetAssociatedStoreProductsAsync( struct object *iface, IUnknown *kinds,
++                                                               struct object **operation )
++{
++    TRACE( "kinds %p, operation %p.\n", kinds, operation );
++    if (!operation) return E_POINTER;
++    *operation = &query_op;
++    return S_OK;
++}
++
++static void init_query_vtables(void)
++{
++    const void **v;
++
++    v = empty_iterable_vtbl;
++    v[0] = empty_iterable_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = empty_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = empty_iterable_First;
++
++    v = empty_iterator_vtbl;
++    v[0] = empty_iterator_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = empty_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = empty_iterator_get_Current; v[7] = empty_iterator_false; /* HasCurrent */
++    v[8] = empty_iterator_false; /* MoveNext */ v[9] = empty_iterator_GetMany;
++
++    v = query_vtbl;
++    v[0] = query_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = query_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = query_get_Products; v[7] = query_get_ExtendedError;
++
++    v = products_vtbl;   /* empty, like AddOnLicenses */
++    v[0] = products_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = products_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = addons_Lookup; v[7] = addons_get_Size; v[8] = addons_HasKey; v[9] = addons_Split;
++
++    v = query_op_vtbl;
++    v[0] = query_op_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = query_op_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = query_op_put_Completed; v[7] = license_op_get_Completed; v[8] = query_op_GetResults;
++
++    v = query_info_vtbl;
++    v[0] = query_op_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
++    v[4] = query_op_GetRuntimeClassName; v[5] = object_GetTrustLevel;
++    v[6] = license_info_get_Id; v[7] = license_info_get_Status; v[8] = license_info_get_ErrorCode;
++    v[9] = license_info_Cancel; v[10] = license_info_Close;
++}
++
+ static HRESULT WINAPI statics_QueryInterface( struct object *iface, REFIID iid, void **out )
+ {
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
+@@ -406,7 +631,10 @@
+     context_vtbl[7] = context_add_OfflineLicensesChanged;
+     context_vtbl[8] = context_remove_OfflineLicensesChanged;
+     context_vtbl[11] = context_GetAppLicenseAsync;
++    context_vtbl[13] = context_GetStoreProductsAsync;
++    context_vtbl[14] = context_GetAssociatedStoreProductsAsync;
+     init_license_vtables();
++    init_query_vtables();
+ 
+     statics_vtbl[0] = statics_QueryInterface;
+     statics_vtbl[1] = object_AddRef;
