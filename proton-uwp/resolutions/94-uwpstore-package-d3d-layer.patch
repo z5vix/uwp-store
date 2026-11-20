@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: z5vix <z5vix@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:10:00 -0500
+Subject: [PATCH] UWP Store: ntdll: give package processes the D3D layer beside the game for system32 loads
+
+Applies after 93-uwpstore-uwp-minecraft.patch. Wine-UWP links DXVK's dxgi/d3d11 and vkd3d-proton's
+d3d12/d3d12core beside each game executable instead of into system32. Gears 5 (Microsoft.HalifaxBaseGame)
+loads d3d12.dll from system32 only, got Wine's d3d12 beside DXVK's dxgi and stopped with "A graphics card
+was not found" (GW503). In a process with WINE_UWP_PACKAGE_PATH set, a bare-name load of one of those four
+DLLs now tries the main executable's folder first.
+---
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -3331,6 +3331,47 @@
+ }
+ 
+ /***********************************************************************
++ *	find_package_d3d_dll
++ *
++ * Wine-UWP links DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core beside each game executable instead of into
++ * system32, where Proton puts them. A game that loads one of them from system32 only (Gears 5 asks for d3d12.dll
++ * that way) would get Wine's own d3d12 beside DXVK's dxgi, find no adapter it can use and stop ("A graphics card
++ * was not found"). In a package process, look beside the main executable first.
++ */
++static NTSTATUS find_package_d3d_dll( const WCHAR *libname, UNICODE_STRING *nt_name, WINE_MODREF **pwm,
++                                      HANDLE *mapping, SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
++{
++    static const WCHAR *layer[] = { L"d3d12.dll", L"d3d12core.dll", L"dxgi.dll", L"d3d11.dll" };
++    static int in_package = -1;
++    const UNICODE_STRING *image = &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName;
++    WCHAR dir[MAX_PATH];
++    unsigned int i, len;
++
++    if (in_package == -1)
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_UWP_PACKAGE_PATH" ), value = { 0, 0, NULL };
++        in_package = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) == STATUS_BUFFER_TOO_SMALL;
++    }
++    if (!in_package) return STATUS_DLL_NOT_FOUND;
++    for (i = 0; i < ARRAY_SIZE(layer); i++) if (!wcsicmp( libname, layer[i] )) break;
++    if (i == ARRAY_SIZE(layer)) return STATUS_DLL_NOT_FOUND;
++
++    len = image->Length / sizeof(WCHAR);
++    while (len && image->Buffer[len - 1] != '\\') len--;
++    if (!len || len + 1 >= ARRAY_SIZE(dir)) return STATUS_DLL_NOT_FOUND;
++    memcpy( dir, image->Buffer, len * sizeof(WCHAR) );
++    dir[len] = 0;
++    if (search_dll_file( dir, libname, nt_name, pwm, mapping, image_info, id ))
++    {
++        RtlFreeUnicodeString( nt_name );
++        *pwm = NULL;
++        return STATUS_DLL_NOT_FOUND;
++    }
++    TRACE( "using %s beside the package executable\n", debugstr_us(nt_name) );
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
+  *	find_dll_file
+  *
+  * Find the file (or already loaded module) for a given dll name.
+@@ -3373,6 +3414,7 @@
+                 return STATUS_DLL_NOT_FOUND;
+             }
+             if (!open_known_dll( libname, nt_name, pwm, mapping, image_info, id )) return STATUS_SUCCESS;
++            if (!find_package_d3d_dll( libname, nt_name, pwm, mapping, image_info, id )) return STATUS_SUCCESS;
+         }
+     }
+ 
